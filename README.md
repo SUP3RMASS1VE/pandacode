@@ -147,7 +147,7 @@ information:
 | Plan usage checks for your signed-in agents | That agent's provider | When you open the menu bar item or the Usage dialog |
 | Public model price list (for cost estimates) | `raw.githubusercontent.com` | Daily |
 | PandaCode's own updates (`latest.json` on this repository's latest release) | `github.com` | At launch and about every 6 hours unless Settings → About → Updates is Off |
-| Direct model server (optional) | The Base URL you enter in Providers | Model list when you enter or refresh the URL or reopen provider settings; prompts and file/tool context only during tasks you start |
+| Direct model server (optional) | The Base URL you enter in Providers | Model list when you enter or refresh the URL or reopen provider settings; prompts, attached images and file/tool context only during tasks you start |
 | Jev decision model list (optional) | `openrouter.ai` | Only when you choose OpenRouter for Jev decisions and open the model menu or press Refresh; no key is sent |
 | Jev decisions on OpenRouter (optional) | `openrouter.ai` | Only when you choose OpenRouter in Settings → Agents → Jev and run a decision check; sends the selected evidence with your key |
 | Cloud agents (optional): the task's checkout, prompt and harness login go to the machine you chose; PandaCode checks on its active runs | The cloud provider you connected | Only for tasks you start on a cloud provider; while a run is active and at launch to re-attach |

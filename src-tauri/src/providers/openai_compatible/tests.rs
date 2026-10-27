@@ -341,3 +341,100 @@ async fn cancelling_a_command_kills_its_child_processes() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert!(!folder.0.join("should-not-exist").exists());
 }
+
+#[tokio::test]
+async fn images_are_sent_inline_and_retained_without_reopening_source_files() {
+    use base64::Engine;
+    let folder = Folder::new();
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    let image = folder.0.join("pixel.png");
+    std::fs::write(
+        &image,
+        base64::engine::general_purpose::STANDARD
+            .decode(png)
+            .unwrap(),
+    )
+    .unwrap();
+    let (base, seen) = mock::serve(|_, _| {
+        (
+            200,
+            r#"{"choices":[{"message":{"content":"A pixel."},"finish_reason":"stop"}]}"#,
+        )
+    });
+    let mut config = config();
+    config.cwd = folder.0.clone();
+    config.images = vec![image.clone()];
+    let (_send, receive) = tokio::sync::mpsc::unbounded_channel();
+    run_session(
+        config.clone(),
+        format!("{base}/v1"),
+        None,
+        "vision".into(),
+        folder.history(),
+        "fixture".into(),
+        sink(),
+        receive,
+        None,
+    )
+    .await
+    .unwrap();
+    let history: History =
+        serde_json::from_slice(&std::fs::read(folder.0.join("history.json")).unwrap()).unwrap();
+    std::fs::remove_file(image).unwrap();
+    config.images.clear();
+    config.prompt = "What colour was it?".into();
+    let (_send, receive) = tokio::sync::mpsc::unbounded_channel();
+    run_session(
+        config,
+        format!("{base}/v1"),
+        None,
+        "vision".into(),
+        Transcript {
+            messages: history.messages,
+            ..folder.history()
+        },
+        "fixture".into(),
+        sink(),
+        receive,
+        None,
+    )
+    .await
+    .unwrap();
+    let calls = seen.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    for call in calls.iter() {
+        let request: Value = serde_json::from_str(&call.body).unwrap();
+        assert_eq!(request["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(request["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            request["messages"][1]["content"][1]["image_url"]["url"],
+            format!("data:image/png;base64,{png}")
+        );
+        assert!(!call.body.contains(folder.0.to_str().unwrap()));
+    }
+}
+
+#[tokio::test]
+async fn invalid_images_fail_before_a_request_or_history_write() {
+    let folder = Folder::new();
+    let image = folder.0.join("invalid.png");
+    std::fs::write(&image, b"not an image").unwrap();
+    let mut config = config();
+    config.cwd = folder.0.clone();
+    config.images = vec![image];
+    let (_send, receive) = tokio::sync::mpsc::unbounded_channel();
+    let result = run_session(
+        config,
+        "http://127.0.0.1:1/v1".into(),
+        None,
+        "vision".into(),
+        folder.history(),
+        "fixture".into(),
+        sink(),
+        receive,
+        None,
+    )
+    .await;
+    assert!(result.unwrap_err().contains("not a PNG"));
+    assert!(!folder.history().path.exists());
+}

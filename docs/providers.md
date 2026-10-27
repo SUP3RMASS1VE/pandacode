@@ -1044,7 +1044,9 @@ PandaCode provides project file reading, listing and editing, and a cancellable
 shell. Ask mode requires approval for writes and commands; Auto approves project
 file edits but asks for commands; Plan refuses both; Full permits both. Conversation
 history stays in the app's local data directory. This provider currently supports
-local text/file tasks, without image attachments, native goals or mid-turn steering.
+local text/file tasks and image attachments for vision-capable models. Images are
+sent as inline PNG data to the selected server and retained in local conversation
+history for follow-ups. Native goals and mid-turn steering are not supported.
 
 The URL and discovered model IDs are saved locally. Optional keys use the existing
 secret store and never come back to the form. Leaving a saved key blank keeps it

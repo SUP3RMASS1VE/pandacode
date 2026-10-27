@@ -438,3 +438,85 @@ async fn invalid_images_fail_before_a_request_or_history_write() {
     assert!(result.unwrap_err().contains("not a PNG"));
     assert!(!folder.history().path.exists());
 }
+
+#[tokio::test]
+async fn steering_is_delivered_to_the_next_model_request() {
+    let folder = Folder::new();
+    let mut config = config();
+    config.cwd = folder.0.clone();
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let (base, seen) = mock::serve(move |_, _| {
+        let _ = started.send(());
+        std::thread::sleep(Duration::from_millis(80));
+        (
+            200,
+            r#"{"choices":[{"message":{"content":"Done."},"finish_reason":"stop"}]}"#,
+        )
+    });
+    let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+    let (events, log) = (
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let output = events.clone();
+    let sink: Sink = Arc::new(move |event| output.lock().unwrap().push(event));
+    let steer = async {
+        starts.recv().await.unwrap();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        send.send(RunInput::Steer {
+            id: "s1".into(),
+            text: "Also explain your change.".into(),
+            reply,
+        })
+        .unwrap();
+        log.lock().unwrap().push(answer.await.unwrap().unwrap());
+        // Keep the control channel alive until the run completes.
+        starts.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    };
+    let run = run_session(
+        config,
+        format!("{base}/v1"),
+        None,
+        "test".into(),
+        folder.history(),
+        "fixture".into(),
+        sink,
+        receive,
+        None,
+    );
+    let (result, _) = tokio::join!(run, steer);
+    result.unwrap();
+    assert_eq!(log.lock().unwrap()[0]["steered"], true);
+    let calls = seen.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let request: Value = serde_json::from_str(&calls[1].body).unwrap();
+    assert_eq!(
+        request["messages"].as_array().unwrap().last().unwrap()["content"],
+        "Also explain your change."
+    );
+    let statuses: Vec<_> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.kind == "steer")
+        .map(|e| e.data.as_ref().unwrap()["status"].clone())
+        .collect();
+    assert_eq!(statuses, vec![json!("pending"), json!("delivered")]);
+}
+
+#[test]
+fn pending_steering_is_reported_failed_when_a_run_stops() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let output = events.clone();
+    let steers = DirectSteers {
+        pending: Mutex::new(vec![("pending".into(), "Do more".into())]),
+        config: config(),
+        sink: Arc::new(move |e| output.lock().unwrap().push(e)),
+    };
+    drop(steers);
+    assert_eq!(
+        events.lock().unwrap()[0].data.as_ref().unwrap()["status"],
+        "failed"
+    );
+}

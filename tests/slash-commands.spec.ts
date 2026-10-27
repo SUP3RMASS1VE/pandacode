@@ -418,3 +418,17 @@ test.describe('slash commands app integration', () => {
     expect(await appCalls(page, 'read_file')).toHaveLength(0);
   });
 });
+
+test('OpenAI Compatible discovers enabled skills and inserts them from the slash menu', async ({ page }) => {
+  await page.route('**/src/preview.ts*', async route => {
+    const response = await route.fetch();
+    await route.fulfill({ response, body: `${await response.text()}\nsessions[0].provider = 'openai-compatible'; sessions[0].model = 'local-model'; previewSkills.call('skills_activate', {id: 'release-notes', harness:'openai-compatible', scope:'user'});` });
+  });
+  await page.goto('/');
+  const prompt = page.locator('#prompt'); await prompt.fill('/release');
+  const skill = page.locator('.slash-menu').getByRole('option', { name: /release-notes/ });
+  await expect(skill).toBeVisible(); await skill.click();
+  await expect(prompt).toHaveValue('/release-notes ');
+  await prompt.fill('/skills:release');
+  await expect(page.locator('.slash-menu').getByRole('option', { name: /skills:release-notes/ })).toBeVisible();
+});

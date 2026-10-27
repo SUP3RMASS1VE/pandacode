@@ -1046,7 +1046,21 @@ file edits but asks for commands; Plan refuses both; Full permits both. Conversa
 history stays in the app's local data directory. This provider currently supports
 local text/file tasks and image attachments for vision-capable models. Images are
 sent as inline PNG data to the selected server and retained in local conversation
-history for follow-ups. Native goals and mid-turn steering are not supported.
+history for follow-ups. Steering messages are delivered after the current response
+and tool batch, before the next model request, without stopping the run.
+
+Enable imported skills and rules for **OpenAI Compatible** in **Settings → Skills &
+rules**, at User or Project scope. Type `/` to choose a skill (or `/skills:name` when
+its name collides with an app command), add your request, and send. The agent also
+sees enabled skill descriptions and can read their instructions and supporting
+files with `read_skill_file`. Enabled rules and the project's `AGENTS.md` are
+included in its instructions. Disabling a skill removes it from discovery and
+resource access. Library safety acknowledgments and scope checks still apply.
+
+The provider can lead or join agent teams and use the app tools passed to the run,
+including previews and enabled browser tools. Native Codex goals and Codex-only
+account/session operations remain specific to Codex; they are not part of the
+chat-completions API.
 
 The URL and discovered model IDs are saved locally. Optional keys use the existing
 secret store and never come back to the form. Leaving a saved key blank keeps it

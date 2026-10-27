@@ -20,6 +20,7 @@ Claude command into a Codex or Kimi command.
 
 | Harness | Discovery | Execution |
 | --- | --- | --- |
+| OpenAI Compatible | Enabled library skills at user/project scope, refreshed locally without a CLI | `/name` or `/skills:name` binds the selected library skill; app controls use the existing PandaCode handlers. |
 | Claude Code | Initialize response, `system/init`, and full `system/commands_changed` replacements; names, aliases, descriptions, and argument hints | Advertised headless commands use Claude's native user-message dispatcher, including skill/custom-command expansion. Local command output is displayed in the conversation. |
 | Codex | App-server `skills/list` with `forceReload`, and `skills/changed` invalidation | Skills bind the exact discovered name/path through typed `skill` input. `/compact` calls `thread/compact/start`; `/review [instructions]` calls `review/start`, reviewing uncommitted changes by default. |
 | Kimi Code | ACP initialization and session-scoped `available_commands_update` | Advertised commands use the ACP slash dispatcher in `session/prompt`, including provider-discovered skills. |

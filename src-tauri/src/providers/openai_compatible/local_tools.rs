@@ -11,6 +11,7 @@ pub(super) fn host(config: &RunConfig, upstream: Option<ToolHost>) -> Result<Too
         .map_err(|_| "The task's project folder is unavailable.")?;
     let text = json!({"type":"string"});
     let mut tools = vec![
+        spec("read_skill_file", "Read an enabled skill's instructions or supporting text file. Use the skill ID from the enabled skills list; path is relative to its folder, such as SKILL.md or references/guide.md.", json!({"skill":text,"path":text}), &["skill","path"]),
         spec("read_file", "Read a UTF-8 file in the project (up to 128 KiB). Paths are project-relative.", json!({"path":text}), &["path"]),
         spec("list_files", "List one directory in the project. Use '.' for the project root.", json!({"path":text}), &["path"]),
         spec("write_file", "Create or replace a project file. Read existing files before replacing them.", json!({"path":text,"content":text}), &["path","content"]),
@@ -37,6 +38,14 @@ pub(super) fn host(config: &RunConfig, upstream: Option<ToolHost>) -> Result<Too
             let root = root.clone();
             let upstream = upstream.clone();
             Box::pin(async move {
+                if name == "read_skill_file" {
+                    let content = crate::skills::direct::library()?.direct_file(
+                        &root,
+                        string(&args, "skill", 200)?,
+                        string(&args, "path", 4096)?,
+                    )?;
+                    return Ok(json!({"content":content}));
+                }
                 if name == "run_command" {
                     return shell(&root, string(&args, "command", 16 * 1024)?).await;
                 }

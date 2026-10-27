@@ -526,3 +526,108 @@ test('Hermes Agent has an install card, four approval modes, and executable sett
   await expect(card.getByLabel('Hermes Agent executable', { exact: true })).toBeVisible();
 });
 
+
+test('OpenAI Compatible starts blank, saves without a key, and selects the local model', async ({ page }, testInfo) => {
+  const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  const openProviders = async () => {
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await page.getByRole('region', { name: 'Settings', exact: true }).getByRole('tab', { name: 'Providers', exact: true }).click();
+  };
+  await openProviders();
+  const card = page.locator('#openai-compatible');
+  await expect(card.getByLabel('Base URL', { exact: true })).toHaveValue('');
+  await expect(card.getByLabel('API key (optional)', { exact: true })).toHaveValue('');
+  await expect(card.getByLabel('Model', { exact: true })).toBeDisabled();
+  await expect(card).toContainText('No account or coding CLI is needed.');
+  await card.getByLabel('Base URL', { exact: true }).fill('http://127.0.0.1:8080/v1');
+  await expect(card.getByLabel('Model', { exact: true })).toHaveValue('org/local-test-model');
+  await expect(card.getByLabel('Model', { exact: true }).locator('option')).toHaveCount(2);
+  await card.getByRole('button', { name: 'Save provider', exact: true }).click();
+  await expect(card.locator('.compatible-feedback')).toContainText('Provider saved');
+  await expect(card.locator('[data-key-status]')).toHaveText('No API key configured.');
+  await card.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('openai-compatible.png') });
+  await page.keyboard.press('Escape');
+  await page.locator('#model-picker-trigger').click();
+  const picker = page.getByRole('dialog', { name: 'Harness and model', exact: true });
+  await picker.getByRole('tab', { name: 'OpenAI Compatible', exact: true }).click();
+  await expect(picker.getByRole('option')).toHaveCount(2);
+  await picker.getByRole('option', { name: 'OpenAI Compatible · org/local-test-model', exact: true }).click();
+  await expect(page.locator('#model-picker-trigger')).toContainText('org/local-test-model');
+  await openProviders();
+  await expect(card.getByLabel('Base URL', { exact: true })).toHaveValue('http://127.0.0.1:8080/v1');
+  await expect(card.getByLabel('Model', { exact: true })).toHaveValue('org/local-test-model');
+  await card.getByLabel('Model', { exact: true }).selectOption('another-model');
+  await card.getByRole('button', { name: 'Save provider', exact: true }).click();
+  await expect(card.locator('.compatible-feedback')).toContainText('Provider saved');
+  await page.keyboard.press('Escape');
+  await page.locator('#model-picker-trigger').click();
+  await picker.getByRole('tab', { name: 'OpenAI Compatible', exact: true }).click();
+  await picker.getByRole('option', { name: 'OpenAI Compatible · another-model', exact: true }).click();
+  await expect(page.locator('#model-picker-trigger')).toContainText('another-model');
+  await openProviders();
+  await card.getByRole('button', { name: 'Remove provider', exact: true }).click();
+  await expect(card.locator('.compatible-feedback')).toHaveText('Provider removed.');
+  await expect(card.getByLabel('Base URL', { exact: true })).toHaveValue('');
+  expect(errors).toEqual([]);
+});
+
+test('OpenAI Compatible keeps a saved key hidden and can remove it', async ({ page }) => {
+  await page.route('**/src/preview.ts*', async route => {
+    const response = await route.fetch();
+    await route.fulfill({ response, body: `${await response.text()}\npreviewConnections = { connections: [{ id: 'local-fixture', provider: 'openai-compatible', name: 'OpenAI Compatible', args: [], env: {}, secretEnv: ['PANDACODE_OPENAI_API_KEY'], revision: 1, openaiCompatible: { baseUrl: 'http://localhost:8080/v1', modelId: 'org/local-test-model', models: ['org/local-test-model', 'another-model'] } }], tasks: {} };` });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('region', { name: 'Settings', exact: true }).getByRole('tab', { name: 'Providers', exact: true }).click();
+  const card = page.locator('#openai-compatible');
+  await expect(card.getByLabel('API key (optional)', { exact: true })).toHaveValue('');
+  await expect(card.getByLabel('API key (optional)', { exact: true })).toHaveAttribute('placeholder', 'Saved · leave blank to keep');
+  await card.getByRole('button', { name: 'Save provider', exact: true }).click();
+  await expect(card.locator('.compatible-feedback')).toContainText('Provider saved');
+  await expect(card.locator('[data-key-status]')).toHaveText('Key saved in secure system storage.');
+  await card.getByRole('button', { name: 'Remove saved key', exact: true }).click();
+  await expect(card.locator('.compatible-feedback')).toHaveText('Saved key removed.');
+  await expect(card.getByLabel('Base URL', { exact: true })).toHaveValue('http://localhost:8080/v1');
+  await expect(card.locator('[data-key-status]')).toHaveText('No API key configured.');
+  await card.getByLabel('API key (optional)', { exact: true }).fill('fixture-never-save-in-browser');
+  await expect(card.locator('.compatible-feedback')).toContainText('API keys can only be used in the desktop app.');
+  await expect(card.getByLabel('API key (optional)', { exact: true })).toHaveValue('');
+});
+
+test('OpenAI Compatible ignores stale discovery and reports empty or unreachable servers', async ({ page }) => {
+  await page.route('**/src/preview.ts*', async route => {
+    const response = await route.fetch();
+    const source = (await response.text()).replace(/case ["']provider_discover_compatible_models["']:[\s\S]*?break;/, `case 'provider_discover_compatible_models': {
+      if (args.baseUrl.includes('slow')) await new Promise(resolve => setTimeout(resolve, 1400));
+      if (args.baseUrl.includes('offline')) throw new Error('Could not reach the model server.');
+      result = args.baseUrl.includes('empty') ? [] : [{id: args.baseUrl.includes('slow') ? 'stale-model' : 'current-model', name: args.baseUrl.includes('slow') ? 'stale-model' : 'current-model', description: ''}]; break;
+    }`);
+    await route.fulfill({ response, body: source });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('region', { name: 'Settings', exact: true }).getByRole('tab', { name: 'Providers', exact: true }).click();
+  const card = page.locator('#openai-compatible');
+  const url = card.getByLabel('Base URL', { exact: true });
+  const model = card.getByLabel('Model', { exact: true });
+  const save = card.getByRole('button', { name: 'Save provider', exact: true });
+  await url.fill('http://slow.test:8080');
+  await expect(card.locator('.compatible-model-status')).toHaveText('Finding models…');
+  await url.fill('http://empty.test:8080');
+  await expect(card.locator('.compatible-model-status')).toContainText('The server returned no models.');
+  await expect(model).toBeDisabled(); await expect(save).toBeDisabled();
+  await url.fill('http://offline.test:8080');
+  await expect(card.locator('.compatible-model-status')).toContainText('Could not reach');
+  await expect(save).toBeDisabled();
+  await url.fill('http://ready.test:8080');
+  await expect(model).toHaveValue('current-model');
+  await expect(model.locator('option')).toHaveCount(1);
+  await expect(save).toBeEnabled();
+  await card.getByRole('button', { name: 'Refresh models', exact: true }).click();
+  await expect(model).toHaveValue('current-model');
+  await save.click();
+  await expect(url).toHaveValue('http://ready.test:8080/v1');
+  await expect(card.locator('.compatible-feedback')).toContainText('Provider saved');
+});

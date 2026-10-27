@@ -65,7 +65,7 @@ impl std::fmt::Display for PathError {
     }
 }
 
-fn scoped_path(root: &Path, value: &str) -> Result<PathBuf, String> {
+pub(crate) fn scoped_path(root: &Path, value: &str) -> Result<PathBuf, String> {
     resolve_scoped_path(root, value).map_err(|e| e.to_string())
 }
 

@@ -3,6 +3,7 @@ import { call, preview } from './bridge';
 import { escape, icon } from './dom';
 import { providerLogo } from './provider-logos';
 import { infoMark } from './tooltip';
+import { mountOpenaiCompatible } from './openai-compatible';
 import type { ConnectionSnapshot } from './connections';
 import type { ProviderId } from './types';
 
@@ -68,6 +69,7 @@ export function mountProviderSettings(host: HTMLElement, saved: () => Promise<un
   const editedPaths = new Set<HTMLInputElement>();
   host.classList.add('provider-connections');
   host.innerHTML = `<p class="dialog-description">Each sign-in, key or plan here is used only by the agent it belongs to.${infoMark(howProvidersWork, 'How providers relate to agents')}<span class="sr-only">${escape(howProvidersWork)}</span></p>${named ? '<section id="named-connections"></section>' : ''}
+    <section class="connection-card" id="openai-compatible"></section>
     <section class="connection-card" id="global-environment"><h3>Global environment variables</h3>
       <p>Added to every agent harness PandaCode starts — for example <code>HTTP_PROXY</code>, <code>HTTPS_PROXY</code> and <code>NO_PROXY</code> behind a proxy.${infoMark(globalEnvHelp, 'How the global environment is applied')}<span class="sr-only">${escape(globalEnvHelp)}</span></p>
       ${envEditor('*')}
@@ -94,7 +96,7 @@ export function mountProviderSettings(host: HTMLElement, saved: () => Promise<un
       <a href="https://platform.xiaomimimo.com/token-plan" target="_blank" rel="noopener noreferrer">Token Plan ${icon('forward')}</a>
       ${envDetails('mimo')}
     </section>
-    <section class="connection-card"><h3>${providerLogo('opencode')}OpenCode</h3><p>Uses the accounts and models configured in OpenCode. Sign in once with <code>opencode auth login</code>.</p><p>Choose which OpenCode models appear in the model selector in Settings → Agents.</p><a href="https://opencode.ai/docs/" target="_blank" rel="noopener noreferrer">Install & sign in ${icon('forward')}</a>${pathForm('opencode', 'OpenCode executable', '/path/to/opencode')}${envDetails('opencode')}</section>
+    <section class="connection-card"><h3>${providerLogo('opencode')}OpenCode</h3><p>Uses the models configured in OpenCode. Cloud providers may need <code>opencode auth login</code>; local servers need no sign-in. Use OpenAI Compatible above for a local server.</p><p>Choose which OpenCode models appear in the model selector in Settings → Agents.</p><a href="https://opencode.ai/docs/" target="_blank" rel="noopener noreferrer">OpenCode setup ${icon('forward')}</a>${pathForm('opencode', 'OpenCode executable', '/path/to/opencode')}${envDetails('opencode')}</section>
     <section class="connection-card"><h3>${providerLogo('antigravity')}Antigravity</h3><p>Connect the official Google Antigravity ACP server. The standalone <code>agy</code> terminal CLI is a different executable.</p><a href="https://antigravity.google/docs/ide/extensions" target="_blank" rel="noopener noreferrer">Get the official ACP server ${icon('forward')}</a>${pathForm('antigravity', 'Antigravity ACP executable', '/path/to/agy_acp_server.par')}${envDetails('antigravity')}</section>
     <section class="connection-card"><h3>${providerLogo('grok')}Grok Build<small>xAI, via ACP</small></h3><p>Uses your Grok sign-in and models. Install with <code>curl -fsSL https://x.ai/cli/install.sh | bash</code>, then run <code>grok login</code> once; PandaCode talks to <code>grok agent stdio</code>.</p><a href="https://docs.x.ai/build/overview" target="_blank" rel="noopener noreferrer">Grok Build docs ${icon('forward')}</a>${pathForm('grok', 'Grok executable', '/path/to/grok')}${envDetails('grok')}</section>
     <section class="connection-card"><h3>${providerLogo('pi')}Pi</h3><p>Uses the accounts, models and extensions configured in Pi. Install Pi and sign in from its CLI before starting a task.</p><a href="https://github.com/earendil-works/pi" target="_blank" rel="noopener noreferrer">Install Pi ${icon('forward')}</a>${pathForm('pi', 'Pi executable', '/path/to/pi')}${envDetails('pi')}</section>
@@ -299,11 +301,12 @@ export function mountProviderSettings(host: HTMLElement, saved: () => Promise<un
     const chosen = endpoint.value;
     void perform(() => call('provider_set_mimo_endpoint', { endpoint: chosen }), 'MiMo endpoint saved.').finally(() => { endpointEdited = false; });
   };
+  const unmountCompatible = mountOpenaiCompatible(host.querySelector<HTMLElement>('#openai-compatible')!, async snapshot => { named?.saved(snapshot); await saved(); });
   host.addEventListener('submit', submit); host.addEventListener('click', click); host.addEventListener('input', input); host.addEventListener('change', change);
   void call<Configuration>('provider_configuration').then(config => { if (!disposed && configurationRevision === 0) render(config); }).catch(error => { if (!disposed && configurationRevision === 0) message(String(error), true); });
   void checkClaude();
   if (named) void import('./connections').then(({ mountConnections }) => { if (!disposed) unmountNamed = mountConnections(host.querySelector<HTMLElement>('#named-connections')!, named.harnesses, named.saved); });
-  return () => { disposed = true; unmountNamed?.(); for (const input of keyInputs) input.value = ''; editedPaths.clear(); host.removeEventListener('submit', submit); host.removeEventListener('click', click); host.removeEventListener('input', input); host.removeEventListener('change', change); };
+  return () => { disposed = true; unmountCompatible(); unmountNamed?.(); for (const input of keyInputs) input.value = ''; editedPaths.clear(); host.removeEventListener('submit', submit); host.removeEventListener('click', click); host.removeEventListener('input', input); host.removeEventListener('change', change); };
 }
 
 function pathForm(provider: string, label: string, placeholder: string): string {

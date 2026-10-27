@@ -3683,6 +3683,7 @@ pub fn run() {
                 cloud_agents::tasks::cloud_agent_set_claude_token,
                 remote::mirror::remote_repo_check,
                 provider_settings::provider_configuration,
+                providers::openai_compatible::provider_discover_compatible_models,
                 connections::connections_list,
                 connections::connection_save,
                 connections::connection_delete,

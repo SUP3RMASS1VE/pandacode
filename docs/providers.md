@@ -1025,11 +1025,36 @@ Accounts, models and thinking levels are omp's own. Live check:
 
 ## Custom OpenAI-compatible endpoints (Ollama, FreeLLMAPI, local models)
 
-PandaCode has no "custom provider" box; it launches harnesses, and a harness
-brings its own model list. For any server that speaks the OpenAI chat API
-(Ollama, LM Studio, [FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi),
-a self-hosted gateway), add it to OpenCode's own config and pick its models in
-PandaCode.
+Settings → Providers → **OpenAI Compatible** connects directly to your model
+server, without OpenCode, another coding CLI, or a PandaCode account. Start with
+the blank **Base URL** and optionally enter an **API key** if your server needs one.
+PandaCode fetches `GET /models` after you enter the address and fills a **Model**
+dropdown. Choose a model and **Save provider**, then select **OpenAI Compatible**
+in the task's model picker. Every discovered model appears there. A bare server
+address automatically uses `/v1`; an explicit API path is preserved.
+
+**Refresh models** checks the server again after you load or change models. The
+list also refreshes when you reopen these settings. There is no background model
+polling. A server must expose the OpenAI-compatible `data[].id` model list and
+`POST /chat/completions`, including tool calling for coding tasks. Streamed and
+ordinary JSON chat responses are supported. The list reflects what the server
+advertises, which may include models that it loads on demand.
+
+PandaCode provides project file reading, listing and editing, and a cancellable
+shell. Ask mode requires approval for writes and commands; Auto approves project
+file edits but asks for commands; Plan refuses both; Full permits both. Conversation
+history stays in the app's local data directory. This provider currently supports
+local text/file tasks, without image attachments, native goals or mid-turn steering.
+
+The URL and discovered model IDs are saved locally. Optional keys use the existing
+secret store and never come back to the form. Leaving a saved key blank keeps it
+for the same server; changing the URL requires entering its key again. Use
+**Remove saved key** to return to unauthenticated access. Requests go only to your
+chosen server, and redirects are refused. Prompts and relevant file/tool results
+are sent to that server during a task.
+
+For multiple models or advanced OpenCode options, you can still configure
+OpenCode yourself:
 
 1. Add the provider to `~/.config/opencode/opencode.json` (or a project
    `opencode.json`). Ollama:
@@ -1066,7 +1091,7 @@ PandaCode.
 
 PandaCode only lists what `opencode models --verbose` reports, so a model that
 is missing there is a config problem; check it with `opencode models` in a
-terminal. At launch PandaCode sets only the permission policy through
+terminal. For ordinary OpenCode tasks, PandaCode sets the permission policy through
 `OPENCODE_CONFIG_CONTENT` (`providers/acp.rs`); your `opencode.json` is read by
 OpenCode as usual and never rewritten. To keep a separate config per setup, add
 a [named connection](#named-connections) for OpenCode with its config folder

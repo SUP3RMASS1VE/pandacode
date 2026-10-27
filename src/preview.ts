@@ -171,6 +171,7 @@ const providers: Provider[] = [
   { id: 'claude', name: 'Claude Code', installed: true, path: '/sample/bin/claude', version: 'Sample provider', models: ['sonnet', 'opus', 'haiku'].map(id => fallbackModel('claude', id)) },
   { id: 'codex', name: 'Codex', installed: true, path: '/sample/bin/codex', version: 'Sample provider', models: [] },
   { id: 'kimi', name: 'Kimi Code', installed: true, path: '/sample/bin/kimi', version: 'Sample provider', models: [] },
+  { id: 'openai-compatible', name: 'OpenAI Compatible', installed: true, path: null, version: '', models: [] },
   { id: 'opencode', name: 'OpenCode', installed: true, path: '/sample/bin/opencode', version: 'Sample provider', models: [] },
   { id: 'glm', name: 'GLM Coding Plan', installed: true, path: '/sample/bin/claude', version: 'Sample provider', models: [] },
   { id: 'antigravity', name: 'Antigravity', installed: false, path: null, version: '', models: [] },
@@ -198,14 +199,14 @@ const previewMimoEndpoints = [
 let previewMimoEndpoint: string | null = null;
 /** Named connections; secret values are dropped, only their names are kept, as on the native side. */
 let previewConnections: import('./connections').ConnectionSnapshot = { connections: [], tasks: {} };
-function previewSaveConnection(input: { id?: string | null; provider: ProviderId; name: string; executable?: string | null; args?: string[]; env?: { name: string; value: string | null; secret: boolean }[]; configDir?: string | null }): import('./connections').ConnectionSnapshot {
+function previewSaveConnection(input: { openaiCompatible?: import('./connections').OpenaiCompatible | null; id?: string | null; provider: ProviderId; name: string; executable?: string | null; args?: string[]; env?: { name: string; value: string | null; secret: boolean }[]; configDir?: string | null }): import('./connections').ConnectionSnapshot {
   const name = String(input.name ?? '').trim();
   if (!name || name.length > 60) throw new Error('Give the connection a name of up to 60 characters.');
   if ((input.args ?? []).length > 32 || (input.args ?? []).some(arg => arg.includes('\0'))) throw new Error('Launch arguments must be non-empty, under 1024 characters and contain no NUL.');
   const existing = previewConnections.connections.find(c => c.id === input.id);
   if (input.id && !existing) throw new Error('This connection no longer exists.');
   const env = input.env ?? [];
-  const next = { id: existing?.id ?? `connection-${Date.now().toString(36)}`, provider: existing?.provider ?? input.provider, name, executable: input.executable || null, args: input.args ?? [], env: Object.fromEntries(env.filter(v => !v.secret).map(v => [v.name, v.value ?? ''])), secretEnv: env.filter(v => v.secret).map(v => v.name), configDir: input.configDir || null, revision: (existing?.revision ?? 0) + 1 };
+  const next = { openaiCompatible: input.openaiCompatible ?? null, id: existing?.id ?? `connection-${Date.now().toString(36)}`, provider: input.openaiCompatible ? input.provider : existing?.provider ?? input.provider, name, executable: input.executable || null, args: input.args ?? [], env: Object.fromEntries(env.filter(v => !v.secret).map(v => [v.name, v.value ?? ''])), secretEnv: env.filter(v => v.secret).map(v => v.name), configDir: input.configDir || null, revision: (existing?.revision ?? 0) + 1 };
   const connections = existing ? previewConnections.connections.map(c => c.id === next.id ? next : c) : [...previewConnections.connections, next];
   previewConnections = { ...previewConnections, connections };
   return previewConnections;
@@ -218,6 +219,7 @@ function remoteCatalog(id: ProviderId): ProviderModel[] {
   return id === 'codex' ? ['gpt-5-codex', 'gpt-5'].map(model => fallbackModel('codex', model)) : [];
 }
 const catalogs: Record<ProviderId, ProviderModel[]> = {
+  'openai-compatible': [],
   // Recorded from `kilo acp` 7.3.41; efforts belong to its current model only.
   kilo: [
     { id: 'kilo/stealth/claude-sonnet-4.6', name: 'Kilo Gateway/Stealth: Claude Sonnet 4.6 (20% off)', description: '', reasoningEfforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'].map(id => ({ id, name: id, description: '' })), defaultReasoningEffort: 'none' },
@@ -948,6 +950,7 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
       if (!['inherit', 'subscription'].includes(args.mode)) throw new Error('Choose a Claude connection mode.');
       previewClaudeMode = args.mode; return invoke<T>('provider_configuration', {});
     }
+    case 'provider_discover_compatible_models': result = ['org/local-test-model', 'another-model'].map(id => ({ id, name: id, description: 'From your model server' })); break;
     case 'connections_list': result = previewConnections; break;
     case 'connection_save': result = previewSaveConnection(args.connection); break;
     case 'connection_delete': {
@@ -1243,7 +1246,7 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
       result = reordered.map(taskSummary); break;
     }
     case 'get_task': result = settleDraft(session(args.sessionId)); break;
-    case 'list_providers': result = args.deviceId ? remoteProviders() : providers; break;
+    case 'list_providers': result = args.deviceId ? remoteProviders() : providers.map(p => { if (p.id !== 'openai-compatible') return p; const endpoint = previewConnections.connections.find(c => c.openaiCompatible)?.openaiCompatible; return {...p, models: (endpoint?.models ?? (endpoint ? [endpoint.modelId] : [])).map(id => ({id, name: id, description: 'From your model server'}))}; }); break;
     case 'provider_check_connection': result = { installed: true, acpReady: true, sessionReady: true, state: 'ready', message: 'Sample connection check. No prompt sent.' }; break;
     case 'list_slash_commands': result = slashCatalog(session(args.sessionId).provider); break;
     case 'resolve_slash_command': result = resolveSlash(session(args.sessionId).provider, String(args.text)); break;
@@ -1258,7 +1261,7 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     case 'app_update_install_supported': result = true; break;
     case 'support_details': result = { version: 'Preview', platform: 'Browser preview', architecture: 'Not reported' }; break;
     case 'browser_inspect': result = args.action === 'read' ? { url: browserState.url, title: browserState.title, text: 'Browser preview sample page', elements: [] } : { dispatched: true }; break;
-    case 'list_provider_models': result = args.deviceId ? remoteCatalog(args.provider as ProviderId) : args.provider === 'opencode' ? previewOpenCodeChoices() : catalogs[args.provider as ProviderId] ?? []; break;
+    case 'list_provider_models': if (args.provider === 'openai-compatible') { const endpoint = previewConnections.connections.find(c => c.openaiCompatible)?.openaiCompatible; result = (endpoint?.models ?? (endpoint ? [endpoint.modelId] : [])).map(id => ({id, name: id, description: 'From your model server'})); break; } result = args.deviceId ? remoteCatalog(args.provider as ProviderId) : args.provider === 'opencode' ? previewOpenCodeChoices() : catalogs[args.provider as ProviderId] ?? []; break;
     case 'list_opencode_models': result = {models: openCodePreviewModels, selectedModelIds: previewOpenCodeSelection(), error: null}; break;
     case 'save_opencode_models': {
       if (!Array.isArray(args.modelIds) || args.modelIds.length > 100 || args.modelIds.some((id: unknown) => typeof id !== 'string' || !id.includes('/') || id.length > 200)) throw new Error('Choose valid OpenCode models.');

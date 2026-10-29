@@ -469,7 +469,8 @@ async fn steering_is_delivered_to_the_next_model_request() {
             reply,
         })
         .unwrap();
-        log.lock().unwrap().push(answer.await.unwrap().unwrap());
+        let response = answer.await.unwrap().unwrap();
+        log.lock().unwrap().push(response);
         // Keep the control channel alive until the run completes.
         starts.recv().await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;

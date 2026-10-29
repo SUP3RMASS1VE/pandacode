@@ -1163,6 +1163,23 @@ function taskConnection(s: Session): import('./connections').Connection | undefi
   const id = namedConnections.tasks[s.id];
   return namedConnections.connections.find(c => c.id === id && c.provider === s.provider);
 }
+let refreshingLocalModels = false;
+async function refreshLocalModels(): Promise<void> {
+  if (refreshingLocalModels || document.hidden || !namedConnections.connections.some(c => c.openaiCompatible)) return;
+  refreshingLocalModels = true;
+  try {
+    const snapshot = await call<import('./connections').ConnectionSnapshot>('connections_refresh_local_models');
+    if (JSON.stringify(snapshot) === JSON.stringify(namedConnections)) return;
+    const endpoint = snapshot.connections.find(c => c.openaiCompatible)?.openaiCompatible;
+    const entry = provider('openai-compatible');
+    if (entry && endpoint) entry.models = (endpoint.models ?? [endpoint.modelId]).map(id => ({ id, name: id, description: 'From your model server' }));
+    modelCatalogs.delete('openai-compatible');
+    onNamedConnections(snapshot);
+  } catch { /* Keep the last working catalog while the local server is unavailable. */ }
+  finally { refreshingLocalModels = false; }
+}
+window.addEventListener('focus', () => void refreshLocalModels());
+setInterval(() => void refreshLocalModels(), 10_000);
 function onNamedConnections(snapshot: import('./connections').ConnectionSnapshot): void { namedConnections = snapshot; refreshModelLabels(); }
 /** The computer the composer's picker lists: a mirror task's, a new task's chosen one, else undefined (local). */
 function composerDevice(): string | undefined {
@@ -5802,7 +5819,7 @@ async function boot(): Promise<void> {
   })()));
   await connectAgentUiActions(() => transcriptVisible() ? state.sessionId : '', performAgentUiAction);
   [state.projects, state.sessions, state.providers] = await Promise.all([call<Project[]>('list_projects'), call<Session[]>('list_sessions'), call<Provider[]>('list_providers')]);
-  run(call<import('./connections').ConnectionSnapshot>('connections_list').then(onNamedConnections));
+  run(call<import('./connections').ConnectionSnapshot>('connections_list').then(snapshot => { onNamedConnections(snapshot); void refreshLocalModels(); }));
   // Queues from an earlier launch wait for an explicit Resume.
   for (const entry of await call<QueuedMessage[]>('queue_list').catch(() => [])) {
     state.queues.set(entry.sessionId, [...(state.queues.get(entry.sessionId) ?? []), entry]);

@@ -41,6 +41,13 @@ pub struct OpenaiCompatible {
 pub const OPENAI_KEY_ENV: &str = "PANDACODE_OPENAI_API_KEY";
 
 impl OpenaiCompatible {
+    fn refresh_models(&mut self, ids: Vec<String>) -> bool {
+        if ids.is_empty() || (self.models == ids && ids.contains(&self.model_id)) { return false; }
+        if !ids.contains(&self.model_id) { self.model_id = ids[0].clone(); }
+        self.models = ids;
+        true
+    }
+
     pub(crate) fn validated(mut self) -> Result<Self> {
         self.base_url = self.base_url.trim().trim_end_matches('/').to_owned();
         self.model_id = self.model_id.trim().to_owned();
@@ -365,6 +372,30 @@ pub async fn connections_list() -> Result<Snapshot> {
     Ok(runtime()?.data.clone())
 }
 
+/// Refresh only saved loopback servers; never probe an arbitrary remote endpoint.
+#[tauri::command]
+pub async fn connections_refresh_local_models() -> Result<Snapshot> {
+    let connections = runtime()?.data.connections.clone();
+    for connection in connections {
+        let Some(endpoint) = connection.openai_compatible.as_ref() else { continue };
+        let Ok(url) = reqwest::Url::parse(&endpoint.base_url) else { continue };
+        if !matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) { continue; }
+        let Ok(key) = compatible_key(Some(&connection.id), &endpoint.base_url) else { continue };
+        let Ok(models) = crate::providers::openai_compatible::discover(&endpoint.base_url, key.as_deref()).await else { continue };
+        // A model can disappear briefly while the server loads its replacement.
+        if models.is_empty() { continue; }
+        let ids: Vec<String> = models.into_iter().map(|model| model.id).collect();
+        let mut runtime = runtime()?;
+        let mut next = runtime.data.clone();
+        let Some(current) = next.connections.iter_mut().find(|c| c.id == connection.id && c.revision == connection.revision) else { continue };
+        let Some(live) = current.openai_compatible.as_mut() else { continue };
+        if !live.refresh_models(ids) { continue; }
+        current.revision += 1;
+        persist(&mut runtime, next)?;
+    }
+    Ok(runtime()?.data.clone())
+}
+
 #[tauri::command]
 pub async fn connection_save(connection: Input) -> Result<Snapshot> {
     crate::blocking(move || {
@@ -482,6 +513,18 @@ fn assign(data: &mut Snapshot, session_id: String, connection_id: Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_models_follow_replacement_but_preserve_available_selection() {
+        let mut endpoint = local_endpoint();
+        assert!(endpoint.refresh_models(vec!["replacement".into()]));
+        assert_eq!(endpoint.model_id, "replacement");
+        assert!(!endpoint.refresh_models(vec![]));
+        assert_eq!(endpoint.models, vec!["replacement"]);
+        assert!(endpoint.refresh_models(vec!["other".into(), "replacement".into()]));
+        assert_eq!(endpoint.model_id, "replacement");
+        assert!(!endpoint.refresh_models(vec!["other".into(), "replacement".into()]));
+    }
 
     fn input(provider: &str) -> Input {
         Input { id: None, provider: provider.into(), name: "Claude Work".into(), executable: None, args: vec![], env: vec![], config_dir: None, openai_compatible: None }

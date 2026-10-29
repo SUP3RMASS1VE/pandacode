@@ -1068,6 +1068,7 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
       previewClaudeMode = args.mode; return invoke<T>('provider_configuration', {});
     }
     case 'provider_discover_compatible_models': result = ['org/local-test-model', 'another-model'].map(id => ({ id, name: id, description: 'From your model server' })); break;
+    case 'connections_refresh_local_models':
     case 'connections_list': result = previewConnections; break;
     case 'connection_save': result = previewSaveConnection(args.connection); break;
     case 'connection_delete': {

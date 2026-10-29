@@ -131,7 +131,7 @@ pub(crate) fn saved_models() -> Vec<ModelInfo> {
     };
     ids.iter().map(|id| model_info(id)).collect()
 }
-async fn discover(base: &str, key: Option<&str>) -> Result<Vec<ModelInfo>, String> {
+pub(crate) async fn discover(base: &str, key: Option<&str>) -> Result<Vec<ModelInfo>, String> {
     let response = with_key(client(15)?.get(format!("{}/models", base_url(base)?)), key)
         .send()
         .await
@@ -452,7 +452,8 @@ pub(super) async fn run(
         .validated()?;
     let base = base_url(&endpoint.base_url)?;
     let key = crate::connections::compatible_key(Some(&connection.id), &endpoint.base_url)?;
-    let model = if config.model.is_empty() || config.model == "default" {
+    let model = if config.model.is_empty() || config.model == "default"
+        || (!endpoint.models.is_empty() && !endpoint.models.iter().any(|id| id == config.model.strip_prefix("pandacode-local/").unwrap_or(&config.model))) {
         endpoint.model_id.clone()
     } else {
         config

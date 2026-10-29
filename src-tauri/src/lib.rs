@@ -19,6 +19,7 @@ mod context_recovery;
 mod conversation_fork;
 mod conversation_import;
 mod design;
+mod progress;
 mod file_preview;
 mod run_script;
 mod github;
@@ -542,7 +543,7 @@ fn app_instructions(chat: bool, worker: bool) -> String {
         return [turn_changes::instruction(), TURN_ENDS].concat();
     }
     let run = if chat { "" } else { run_script::INSTRUCTIONS };
-    [session_titles::GUIDANCE, run, turn_changes::instruction(), TURN_ENDS, RICH_QUESTIONS, GENERATIVE_UI].concat()
+    [session_titles::GUIDANCE, run, turn_changes::instruction(), TURN_ENDS, RICH_QUESTIONS, GENERATIVE_UI, VISUAL_PROGRESS].concat()
 }
 
 /// PandaCode closes the harness when a turn ends, so background waits never come back.
@@ -553,6 +554,9 @@ const RICH_QUESTIONS: &str = "\n\nQuestions you ask through the request_user_inp
 
 /// Replies may carry generative UI blocks that PandaCode draws in the thread.
 const GENERATIVE_UI: &str = "\n\nGenerative UI: when a visual beats prose, a reply may include a ```ui block holding JSON {\"type\":…}; ```chart, ```svg and ```html work too. Types (fields): callout(tone info|success|warning|danger|note,title,body), card(title,body,footer,actions,children), stats(items[{label,value,delta,hint,spark[]}]), table(title,columns[],rows[[…]]), chart(chart bar|line|pie|area|sparkline,title,labels,series[{name,values}]), progress(label,value,max), plan|steps|timeline(title,summary,items[{title,detail,status done|active|pending|error|skipped,time}],actions), checklist(items[{text,done}]), tabs|accordion(items[{label,body,children}]), tree(paths[] or items[{name,status,children}]), diff(file,diff), code(file,language,code), terminal(command,output,exitCode), compare(items[{title,pros,cons,verdict}]), gallery(images[{path,caption}]), actions(buttons[{label,prompt,tone}]), chips|followups(options[{label,prompt}]), or inline :codex-followup[Label]{prompt=\"…\"}, form(title,fields[{name,label,type text|textarea|number|select|checkbox,options}],submit,prompt with {name}), stack|grid(columns,children), custom(html,css,state; data-ui-toggle=\"#id\", data-ui-tab/data-ui-panel, data-ui-set=\"k=v\", data-ui-bind=\"k\", data-ui-prompt). Bodies are Markdown. Buttons and forms only put a prompt in the user's composer; nothing runs, and remote URLs are not loaded. ```mermaid shows as labelled source. For a page that needs scripts, write an HTML file and open it with pandacode_preview_file.";
+
+/// Agents building a GUI post one annotated screenshot per iteration to the progress timeline.
+const VISUAL_PROGRESS: &str = "\n\nVisual progress: only when your work has a graphical interface you can actually capture (a web page, desktop or mobile app, simulator, VM screen or design artboard), after each meaningful visual iteration save a screenshot of only that app's own window or page (a headless browser screenshot, a simulator or VM screenshot tool, or `screencapture -l<windowid>` on macOS; never the whole screen or other windows) under .pandacode/progress-shots/, call pandacode_progress_snapshot with a short title, an optional note and a few annotations pointing at what changed, then delete the file, since the image is copied. Before a UI exists you may post an svg idea sketch instead. Post at most one per iteration, and skip this entirely for CLIs, libraries, backend or docs work, or when no such screenshot can be taken.";
 
 /// Harnesses without a system prompt hear the app instructions again every few turns.
 const INSTRUCTION_REMINDER_EVERY: i64 = 8;
@@ -570,18 +574,18 @@ mod instruction_tests {
         assert_eq!(reminded, [1, 9, 17]);
         assert!(!reminder_turn(0));
         let text = app_instructions(false, false);
-        for part in ["Sidebar titles:", "Run and preview workflow:", "File change tracking:", "Questions you ask through the request_user_input tool", "Your turn ends when you reply", "Generative UI:"] {
+        for part in ["Sidebar titles:", "Run and preview workflow:", "File change tracking:", "Questions you ask through the request_user_input tool", "Your turn ends when you reply", "Generative UI:", "Visual progress:"] {
             assert!(text.contains(part), "{part}");
         }
         let chat = app_instructions(true, false);
-        assert!(!chat.contains("Run and preview workflow:") && chat.contains("Sidebar titles:"));
+        assert!(!chat.contains("Run and preview workflow:") && chat.contains("Sidebar titles:") && chat.contains("Visual progress:"));
     }
 
     #[test]
     fn team_workers_get_only_change_tracking_and_turn_end() {
         let lead = app_instructions(false, false);
         let worker = app_instructions(false, true);
-        assert_eq!(lead, [session_titles::GUIDANCE, run_script::INSTRUCTIONS, turn_changes::instruction(), TURN_ENDS, RICH_QUESTIONS, GENERATIVE_UI].concat());
+        assert_eq!(lead, [session_titles::GUIDANCE, run_script::INSTRUCTIONS, turn_changes::instruction(), TURN_ENDS, RICH_QUESTIONS, GENERATIVE_UI, VISUAL_PROGRESS].concat());
         assert_eq!(worker, [turn_changes::instruction(), TURN_ENDS].concat());
         assert!(worker.contains("File change tracking:") && worker.contains("Your turn ends when you reply"));
         for gone in ["Sidebar titles:", "Run and preview workflow:", "Generative UI:", "request_user_input"] {
@@ -2076,6 +2080,8 @@ async fn launch_operation_admitted(
         let host = simulator::tools::with_simulator_for(host, app.clone(), session_id.clone(), stopped.clone());
         let host = vm::tools::with_vm(host, app.clone(), session_id.clone(), stopped.clone());
         let host = design::with_design(host, app.clone(), session_id.clone(), stopped.clone());
+        // A cloud agent's checkout is on its machine, where screenshots cannot be read.
+        let host = if cloud { host } else { progress::with_progress(host, app.clone(), session_id.clone(), stopped.clone()) };
         let host = cloud::deploy::with_deploy(host, app.clone(), session_id.clone(), stopped.clone());
         let host = Some(agent_tools::with_preview(host, app.clone(), session_id.clone(), stopped.clone()));
         let host = Some(turn_changes::with_host(host, tracker.clone(), stopped.clone()));
@@ -4045,6 +4051,10 @@ pub fn run() {
                 design::design_read,
                 design::design_comments,
                 design::design_save_comments,
+                progress::progress_list,
+                progress::progress_media,
+                progress::progress_thumb,
+                progress::progress_clear,
                 workspace_image,
                 resolve_workspace_files,
                 prepare_file_preview,

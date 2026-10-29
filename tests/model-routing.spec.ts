@@ -343,3 +343,134 @@ test('the Team button keeps its label and fits the toolbar from wide to the narr
     }
   }
 });
+
+test('Unavailable models lists a paused model and Allow now clears it', async ({ page }) => {
+  await install(page);
+  await openAgents(page);
+  const group = settings(page).getByRole('group', { name: 'Unavailable models', exact: true });
+  await expect(group).toBeVisible();
+  await expect(group.getByText('gpt-6.1-sol · Command Code')).toBeVisible();
+  await expect(group.getByText(/^Paused \d+ min$/)).toBeVisible();
+  await group.getByRole('button', { name: 'Allow gpt-6.1-sol · Command Code now', exact: true }).click();
+  await expect(group).toBeHidden();
+  expect((await calls(page, 'model_health_clear')).at(-1).args).toEqual({ provider: 'commandcode', model: 'gpt-6.1-sol' });
+});
+
+test('Models for teams saves harness and model exclusions', async ({ page }) => {
+  await install(page);
+  await openAgents(page);
+  const group = settings(page).getByRole('group', { name: 'Models for teams', exact: true });
+  const last = async () => (await calls(page, 'model_routing_set_exclusions')).at(-1)?.args;
+  const claude = group.getByRole('checkbox', { name: 'Use Claude Code for teams', exact: true });
+  await expect(claude).toBeChecked();
+  await claude.uncheck();
+  await expect.poll(last).toEqual({ providers: ['claude'], models: [] });
+  await group.getByRole('button', { name: 'Codex models', exact: true }).click();
+  await expect(group.getByRole('button', { name: 'Codex models', exact: true })).toHaveAttribute('aria-expanded', 'true');
+  const model = group.locator('#routing-pool-codex .routing-pool-model').first();
+  const id = await model.getAttribute('data-model');
+  await model.uncheck();
+  await expect.poll(last).toEqual({ providers: ['claude'], models: [{ provider: 'codex', model: id }] });
+  await claude.check();
+  await expect.poll(last).toEqual({ providers: [], models: [{ provider: 'codex', model: id }] });
+  await expect(group.getByRole('status')).toHaveText(/^\d+ models on$/);
+});
+
+test('a health refresh keeps focus on an Allow button and updates the countdown in place', async ({ page }) => {
+  await page.clock.install();
+  await install(page);
+  await openAgents(page);
+  const group = settings(page).getByRole('group', { name: 'Unavailable models', exact: true });
+  const allow = group.getByRole('button', { name: 'Allow gpt-6.1-sol · Command Code now', exact: true });
+  await expect(group.getByText('Paused 8 min', { exact: true })).toBeVisible();
+  await allow.focus();
+  await page.clock.fastForward('02:00');
+  await expect(group.getByText('Paused 6 min', { exact: true })).toBeVisible();
+  await expect(allow).toBeFocused();
+});
+
+test('the warning shows when every model of every harness is off', async ({ page }) => {
+  await install(page);
+  await openAgents(page);
+  const group = settings(page).getByRole('group', { name: 'Models for teams', exact: true });
+  const warning = group.getByRole('alert');
+  await expect(warning).toBeHidden();
+  for (const expand of await group.locator('.routing-pool-expand').all()) {
+    await expand.click();
+    const list = group.locator(`#${await expand.getAttribute('aria-controls')}`);
+    await expect(list).not.toHaveText('Loading…');
+    for (const box of await list.locator('.routing-pool-model').all()) await box.uncheck();
+  }
+  await expect(warning).toHaveText("No model is on for teams. Workers will use the lead's model.");
+  await expect(group.getByRole('status')).toHaveText('0 models on');
+});
+
+test('Models for teams stays disabled until the saved exclusions load', async ({ page }) => {
+  await install(page);
+  await page.evaluate(() => { (window as any).__routingDelay = { model_routing_exclusions: 800 }; });
+  await openAgents(page);
+  const group = settings(page).getByRole('group', { name: 'Models for teams', exact: true });
+  const claude = group.getByRole('checkbox', { name: 'Use Claude Code for teams', exact: true });
+  await expect(group).toHaveAttribute('aria-busy', 'true');
+  await expect(claude).toBeDisabled();
+  await expect(claude).toBeEnabled();
+  await expect(group).toHaveAttribute('aria-busy', 'false');
+});
+
+test('exclusion saves run in order and the last one wins', async ({ page }) => {
+  await install(page);
+  await openAgents(page);
+  const group = settings(page).getByRole('group', { name: 'Models for teams', exact: true });
+  const claude = group.getByRole('checkbox', { name: 'Use Claude Code for teams', exact: true });
+  const codex = group.getByRole('checkbox', { name: 'Use Codex for teams', exact: true });
+  await expect(claude).toBeEnabled();
+  // The first save is slow; the next ones must wait for it rather than overtake it.
+  await page.evaluate(() => { (window as any).__routingDelay = { model_routing_set_exclusions: 600 }; });
+  await claude.uncheck();
+  await page.evaluate(() => { delete (window as any).__routingDelay; });
+  await codex.uncheck();
+  await claude.check();
+  const saves = async () => (await calls(page, 'model_routing_set_exclusions')).map(entry => entry.args);
+  await expect.poll(async () => (await saves()).at(-1)).toEqual({ providers: ['codex'], models: [] });
+  // Every save after the slow one carries codex: none was built before it and sent past it.
+  const sent = await saves();
+  expect(sent[0]).toEqual({ providers: ['claude'], models: [] });
+  expect(sent.slice(1).every(args => args.providers.includes('codex'))).toBe(true);
+  await expect(claude).toBeChecked();
+  await expect(codex).not.toBeChecked();
+});
+
+test('a long catalog shows its recent models and Add model… adds one for teams', async ({ page }) => {
+  await install(page, () => localStorage.setItem('pandacode.recent-models.hermes', JSON.stringify(Array.from({ length: 10 }, (_, i) => `nous/sample-${i + 1}`))));
+  await openAgents(page);
+  const group = settings(page).getByRole('group', { name: 'Models for teams', exact: true });
+  await group.getByRole('button', { name: 'Hermes Agent models', exact: true }).click();
+  const list = group.locator('#routing-pool-hermes');
+  await expect(list.locator('.routing-pool-limit')).toHaveText('Showing 10 of 14 models · Add model…');
+  await expect(list.getByRole('checkbox', { name: 'Use Nous Sample 12 (Hermes Agent) for teams' })).toHaveCount(0);
+  const add = list.getByRole('button', { name: 'Add model…', exact: true });
+  await add.click();
+  const dialog = page.getByRole('dialog', { name: 'Models for teams: Hermes Agent' });
+  const search = dialog.getByRole('searchbox', { name: 'Search Hermes Agent models' });
+  await expect(search).toBeFocused();
+  await expect(dialog.getByRole('checkbox', { name: /Nous Sample 1\b/ })).toBeDisabled();
+  await expect(dialog.getByText('Recently used, always included').first()).toBeVisible();
+  await search.fill('sample 12');
+  await dialog.getByRole('checkbox', { name: /Nous Sample 12/ }).check();
+  await expect(dialog.getByRole('status')).toHaveText('1 added');
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(settings(page)).toBeVisible();
+  await expect(list.getByRole('button', { name: 'Add model…', exact: true })).toBeFocused();
+  await expect(list.locator('.routing-pool-limit')).toHaveText('Showing 11 of 14 models · Add model…');
+  await expect(list.getByRole('checkbox', { name: 'Use Nous Sample 12 (Hermes Agent) for teams' })).toBeChecked();
+  expect(await page.evaluate(() => localStorage.getItem('pandacode.team-models.added.hermes'))).toBe('["nous/sample-12"]');
+  // The team catalog follows: Try it routes over the limited set plus the added model.
+  await settings(page).getByRole('textbox', { name: 'Task to route' }).fill('Fix the failing login test');
+  await settings(page).getByRole('button', { name: 'Route', exact: true }).click();
+  await expect.poll(async () => (await calls(page, 'model_routing_route')).length).toBe(1);
+  const hermes = (await calls(page, 'model_routing_route'))[0].args.pool.filter((m: any) => m.provider === 'hermes').map((m: any) => m.model);
+  expect(hermes).toContain('nous/sample-12');
+  expect(hermes).not.toContain('nous/sample-11');
+  expect(hermes).not.toContain('anthropic/claude-sonnet-4');
+});

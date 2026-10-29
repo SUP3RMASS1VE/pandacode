@@ -111,6 +111,22 @@ let id = 10;
 const ROUTING_KEY = 'pandacode.preview.routing';
 let previewRouting = { enabled: true, mode: 'balanced', minP: 0.5, profiler: 'missing', error: null as string | null };
 try { previewRouting = { ...previewRouting, ...JSON.parse(localStorage.getItem(ROUTING_KEY) ?? '{}') }; } catch { /* Defaults. */ }
+let previewExclusions = { providers: [] as string[], models: [] as { provider: string; model: string }[] };
+// Two seeded tiers; keys are the mock's normalized model names.
+let previewTiers: Record<string, string> = { 'claude-sonnet-5-5': 'S', 'deepseek-v4-pro': 'B' };
+/** Stand-in for native grouping: one row per model name across harnesses; experimental or default entries are unrated. */
+function previewTierModels(pool: { provider: string; model: string; name: string }[]) {
+  const rows = new Map<string, { key: string; name: string; cardId: string | null; providers: string[]; rated: boolean }>();
+  for (const m of pool) {
+    const key = m.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const rated = !/exp|default|adaptive/i.test(m.name);
+    const row = rows.get(key) ?? { key, name: m.name, cardId: rated ? key : null, providers: [], rated };
+    if (!row.providers.includes(m.provider)) row.providers.push(m.provider);
+    rows.set(key, row);
+  }
+  return [...rows.values()];
+}
+let previewHealth = [{ provider: 'commandcode', model: 'gpt-6.1-sol', reason: 'Two runs in a row ended with a provider error (sample).', until: Date.now() + 8 * 60_000, failures: 2, providerDown: false }];
 const saveRouting = () => { try { localStorage.setItem(ROUTING_KEY, JSON.stringify(previewRouting)); } catch { /* Kept in memory only. */ } };
 /** Deterministic stand-in for Panda Router: longer text reads as harder, later pool entries as pricier and stronger. */
 function previewRoute(text: string, pool: { provider: string; model: string; name: string }[]) {
@@ -197,6 +213,14 @@ const previewMimoEndpoints = [
   { id: 'api', url: 'https://api.xiaomimimo.com/anthropic', label: 'Pay-as-you-go API' },
 ];
 let previewMimoEndpoint: string | null = null;
+let previewAgentsDockPreferences = { enabled: true, keepOnScreen: true, pinned: false };
+const previewAgentsDockSnapshot = {
+  agents: [
+    { id: 'preview-active', title: 'Polish the new onboarding', projectName: 'PandaCode', provider: 'codex', model: 'gpt-5.6-sol', status: 'running', elapsedSeconds: 94 },
+    { id: 'preview-approval', title: 'Build a responsive gallery', projectName: 'Gallery', provider: 'claude', model: 'sonnet', status: 'waiting-for-approval', elapsedSeconds: 327 },
+    { id: 'preview-input', title: 'Prepare the release notes', projectName: 'Website', provider: 'pi', model: 'anthropic/sonnet', status: 'waiting-for-input', elapsedSeconds: 41 },
+  ],
+};
 /** Named connections; secret values are dropped, only their names are kept, as on the native side. */
 let previewConnections: import('./connections').ConnectionSnapshot = { connections: [], tasks: {} };
 function previewSaveConnection(input: { openaiCompatible?: import('./connections').OpenaiCompatible | null; id?: string | null; provider: ProviderId; name: string; executable?: string | null; args?: string[]; env?: { name: string; value: string | null; secret: boolean }[]; configDir?: string | null }): import('./connections').ConnectionSnapshot {
@@ -254,6 +278,8 @@ const catalogs: Record<ProviderId, ProviderModel[]> = {
     { id: 'default', name: 'Default model', description: 'Uses the model configured in Hermes (~/.hermes/config.yaml).' },
     { id: 'nous/hermes-3-llama-3.1-405b', name: 'Hermes 3 Llama 3.1 405B', description: 'Flagship open-weights model fine-tuned by Nous Research.' },
     { id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4', description: 'Sample Hermes provider model.' },
+    // A long catalog (over the team limit of 10) for Settings → Model routing.
+    ...Array.from({ length: 12 }, (_, i) => ({ id: `nous/sample-${i + 1}`, name: `Nous Sample ${i + 1}`, description: 'Sample Hermes provider model.' })),
   ],
   muse: ['muse-wonder-1.0', 'muse-spark-1.3'].map(id => ({ id, name: id, description: '', reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map(effort => ({ id: effort, name: effort === 'xhigh' ? 'Extra high' : effort[0].toUpperCase() + effort.slice(1), description: '' })), defaultReasoningEffort: 'high', contextWindow: 1007997 })),
   opencode: openCodePreviewModels,
@@ -290,7 +316,54 @@ const catalogs: Record<ProviderId, ProviderModel[]> = {
     { id: 'zcproxy/GLM-5.3', name: 'zcproxy/GLM-5.3', description: 'OmniRouter', reasoningEfforts: ['low', 'high', 'max'].map(effort => ({ id: effort, name: effort[0].toUpperCase() + effort.slice(1), description: '' })), defaultReasoningEffort: 'max', contextWindow: 200000 },
   ],
 };
-let git: GitStatus = { branch: 'feat/instant-search', isRepo: true, files: [{ path: 'src/components/search.ts', index: ' ', working: 'M' }, { path: 'src/lib/search-index.ts', index: '?', working: '?' }, { path: 'src/components/search.test.ts', index: ' ', working: 'M' }] };
+// `?bench=diff` (or localStorage `pandacode.bench` = `diff`) adds synthetic, deterministic
+// patches of known size for tests/diff-perf.spec.ts; other runs never see them.
+const benchDiffs = typeof location !== 'undefined' && (new URLSearchParams(location.search).get('bench') === 'diff' || localStorage.getItem('pandacode.bench') === 'diff');
+const BENCH_LINES: Record<string, (n: number, word: string) => string> = {
+  ts: (n, w) => [`export function ${w}${n}(input: ${w[0].toUpperCase()}${w.slice(1)}Options): number {`, `  const ${w} = input.items.filter(item => item.weight > ${n % 17});`, `  if (!${w}.length) return ${n};`, `  return ${w}.reduce((total, item) => total + item.weight * ${n % 9 + 1}, 0);`, `}`, `// ${w} keeps the index warm between keystrokes (${n})`, `const ${w}Cache = new Map<string, ${w[0].toUpperCase()}${w.slice(1)}Entry>();`][n % 7],
+  rs: (n, w) => [`pub fn ${w}_${n}(input: &[u32]) -> u64 {`, `    let ${w}: u64 = input.iter().map(|v| *v as u64 * ${n % 9 + 1}).sum();`, `    if ${w} > ${n} { return ${w}; }`, `    ${w}.saturating_sub(${n % 13})`, `}`, `// ${w} runs on the background pool (${n})`][n % 6],
+  css: (n, w) => [`.${w}-${n} {`, `  padding: ${n % 12}px ${n % 7}px;`, `  color: rgb(var(--accent-rgb) / 0.${n % 9 + 1});`, `  border-radius: ${n % 5}px;`, `}`][n % 5],
+  json: (n, w) => `  "${w}${n}": { "weight": ${n % 97}, "enabled": ${n % 2 === 0}, "label": "${w} ${n}" },`,
+  md: (n, w) => [`## ${w[0].toUpperCase()}${w.slice(1)} ${n}`, ``, `The ${w} step runs after indexing and takes about ${n % 40} ms on a warm cache.`, `- Keep ${w} under ${n % 9 + 1} passes`, `- See \`${w}${n}()\` for details`][n % 5],
+};
+const BENCH_WORDS = ['search', 'index', 'render', 'token', 'cache', 'query', 'layout', 'stream', 'parse', 'merge'];
+/** One file of `changed` added+removed lines in hunks of ~40, from a fixed seed so every run gets the same bytes. */
+function benchPatch(path: string, lang: string, changed: number, seed: number): string {
+  let state = seed >>> 0;
+  const random = () => { state = (state * 1664525 + 1013904223) >>> 0; return state / 2 ** 32; };
+  const line = () => BENCH_LINES[lang](Math.floor(random() * 10_000), BENCH_WORDS[Math.floor(random() * BENCH_WORDS.length)]);
+  const out = [`diff --git a/${path} b/${path}`, 'index 64d221a..0e6c9ef 100644', `--- a/${path}`, `+++ b/${path}`];
+  let oldLine = 1, newLine = 1, left = changed;
+  while (left > 0) {
+    const size = Math.min(left, 40), body: string[] = [];
+    let oldCount = 0, newCount = 0;
+    for (let i = 0; i < 3; i++, oldCount++, newCount++) body.push(' ' + line());
+    for (let done = 0; done < size;) {
+      const run = Math.min(size - done, 1 + Math.floor(random() * 6)), kind = random();
+      for (let i = 0; i < run; i++) {
+        if (kind < 0.4) { body.push('-' + line()); oldCount++; } else if (kind < 0.8) { body.push('+' + line()); newCount++; } else { body.push(' ' + line()); oldCount++; newCount++; }
+      }
+      if (kind < 0.8) done += run;
+    }
+    for (let i = 0; i < 3; i++, oldCount++, newCount++) body.push(' ' + line());
+    out.push(`@@ -${oldLine},${oldCount} +${newLine},${newCount} @@`, ...body);
+    oldLine += oldCount + 20; newLine += newCount + 20; left -= size;
+  }
+  return out.join('\n') + '\n';
+}
+// Sizes are changed lines; with context the patches are ~47, ~1.1k, ~4k, ~30k and ~3k lines.
+const BENCH_DIFFS: Record<string, () => string> = {
+  'bench/small.ts': () => benchPatch('bench/small.ts', 'ts', 30, 1),
+  'bench/medium.ts': () => benchPatch('bench/medium.ts', 'ts', 800, 2),
+  'bench/large.ts': () => benchPatch('bench/large.ts', 'ts', 2800, 3),
+  'bench/huge.ts': () => benchPatch('bench/huge.ts', 'ts', 21_200, 4),
+  'bench/multi': () => Array.from({ length: 10 }, (_, i) => { const lang = ['ts', 'rs', 'css', 'json', 'md'][i % 5]; return benchPatch(`bench/multi/file-${i}.${lang}`, lang, 200, 10 + i); }).join(''),
+};
+// Production builds have no /src/preview.ts to import, so the benchmark reads patches here.
+if (benchDiffs) (window as any).__benchDiffs = BENCH_DIFFS;
+// `&benchFiles=bench/large.ts,bench/small.ts` lists only those bench files in git status.
+const benchListed = new URLSearchParams(typeof location !== 'undefined' ? location.search : '').get('benchFiles')?.split(',') ?? Object.keys(BENCH_DIFFS);
+let git: GitStatus = { branch: 'feat/instant-search', isRepo: true, files: [{ path: 'src/components/search.ts', index: ' ', working: 'M' }, { path: 'src/lib/search-index.ts', index: '?', working: '?' }, { path: 'src/components/search.test.ts', index: ' ', working: 'M' }, ...(benchDiffs ? benchListed.filter(path => BENCH_DIFFS[path]).map(path => ({ path, index: ' ', working: 'M' })) : [])] };
 const worktreeGit = new Map<string, GitStatus>();
 const previewBranches = new Set<string>(), pushedBranches = new Set<string>(['feat/instant-search']), mergedBranches = new Set<string>();
 function checkoutGit(sessionId: unknown): GitStatus {
@@ -825,8 +898,47 @@ function trayCommand(command: string, args: Record<string, any>): unknown {
     checking: false,
   };
 }
+/** The Running agents widget's commands (header and pinned window). */
+function previewAgentsDock<T>(command: string, args: Record<string, any>): T {
+  if (command === 'agents_dock_snapshot') {
+    // Tests push a native change event with this, as the app does when a run's state changes.
+    (window as any).__agentsDockPush = () => emit('agents-dock-changed', structuredClone(previewAgentsDockSnapshot));
+    return structuredClone(previewAgentsDockSnapshot) as T;
+  }
+  if (command === 'agents_dock_preferences') return structuredClone(previewAgentsDockPreferences) as T;
+  if (command === 'agents_dock_save_preferences') {
+    previewAgentsDockPreferences = {
+      enabled: Boolean(args.enabled),
+      keepOnScreen: Boolean(args.keepOnScreen),
+      pinned: args.enabled ? previewAgentsDockPreferences.pinned : false,
+    };
+    emit('agents-dock-preferences-changed', structuredClone(previewAgentsDockPreferences));
+    return structuredClone(previewAgentsDockPreferences) as T;
+  }
+  if (command === 'agents_dock_pin') {
+    if (!previewAgentsDockPreferences.enabled) throw new Error('Enable the Running agents widget first.');
+    previewAgentsDockPreferences = { ...previewAgentsDockPreferences, pinned: true };
+    emit('agents-dock-preferences-changed', structuredClone(previewAgentsDockPreferences));
+    return null as T;
+  }
+  if (command === 'agents_dock_unpin') {
+    previewAgentsDockPreferences = { ...previewAgentsDockPreferences, pinned: false };
+    emit('agents-dock-preferences-changed', structuredClone(previewAgentsDockPreferences));
+    return null as T;
+  }
+  if (command === 'agents_dock_set_expanded') { (window as any).__agentsDockExpanded = Boolean(args.expanded); return null as T; }
+  if (command === 'agents_dock_open_task') {
+    (window as any).__agentsDockOpened = args.sessionId;
+    emit('overlay-open-task', { sessionId: args.sessionId });
+    return null as T;
+  }
+  throw new Error(`Unknown running-agents command: ${command}`);
+}
+
 export async function invoke<T>(command: string, args: Record<string, any>): Promise<T> {
   if (command.startsWith('tray_')) return trayCommand(command, args) as T;
+  // An if chain, not a switch: specs patch the first command switch in this file to record calls.
+  if (command.startsWith('agents_dock_')) return previewAgentsDock<T>(command, args);
   if (command.startsWith('jj_')) return (await import('./preview-jj')).invokeJj<T>(command, args);
   if (command.includes('moodboard')) return (await import('./preview-moodboards')).invokeMoodboards<T>(command, args);
   if (command === 'bots_list' || command.startsWith('bot_')) return invokeBots<T>(command, args, {
@@ -1024,6 +1136,13 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     case 'model_routing_status': result = { ...previewRouting }; break;
     case 'model_routing_configure': previewRouting = { ...previewRouting, ...(args.enabled != null ? { enabled: Boolean(args.enabled) } : {}), ...(args.mode ? { mode: args.mode } : {}), ...(args.minP != null ? { minP: Math.min(0.9, Math.max(0.3, Number(args.minP))) } : {}) }; saveRouting(); result = { ...previewRouting }; break;
     case 'model_routing_prepare': previewRouting = { ...previewRouting, profiler: 'ready', error: null }; saveRouting(); result = { ...previewRouting }; break;
+    case 'model_routing_exclusions': result = structuredClone(previewExclusions); break;
+    case 'model_routing_set_exclusions': previewExclusions = { providers: [...(args.providers as string[] ?? [])], models: [...(args.models as any[] ?? [])] }; result = structuredClone(previewExclusions); break;
+    case 'model_routing_tier_models': result = previewTierModels(args.pool as any[] ?? []); break;
+    case 'model_routing_tiers': result = { ...previewTiers }; break;
+    case 'model_routing_set_tiers': previewTiers = Object.fromEntries(Object.entries(args.tiers as Record<string, string> ?? {}).filter(([, tier]) => /^[SABCD]$/.test(tier))); result = { ...previewTiers }; break;
+    case 'model_health_list': result = previewHealth.map(entry => ({ ...entry })); break;
+    case 'model_health_clear': previewHealth = previewHealth.filter(entry => (args.provider != null && entry.provider !== args.provider) || (args.model != null && entry.model !== args.model)); result = previewHealth.map(entry => ({ ...entry })); break;
     case 'model_routing_route': result = previewRoute(String(args.text), args.pool as any[]); break;
     case 'architect_get': result = architect.get(args.sessionId); break;
     case 'architect_configure': result = architect.configure(args.sessionId, args.config, args.architect, args.profileId); break;
@@ -1428,7 +1547,7 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     }
     case 'respond_approval': case 'respond_user_input': break;
     case 'git_status': result = checkoutGit(args.sessionId); break;
-    case 'git_diff': result = `diff --git a/${args.path ?? 'src/components/search.ts'} b/${args.path ?? 'src/components/search.ts'}\nindex 64d221a..0e6c9ef 100644\n--- a/${args.path ?? 'src/components/search.ts'}\n+++ b/${args.path ?? 'src/components/search.ts'}\n@@ -12,5 +12,6 @@ export function mountSearch(items) {\n+  const index = createSearchIndex(items);\n+\n   input.addEventListener("input", () => {\n-    const index = createSearchIndex(items);\n-    renderAll(index.search(input.value));\n+    renderResults(index.search(input.value));\n   });\n }`; break;
+    case 'git_diff': if (benchDiffs && BENCH_DIFFS[args.path]) { result = BENCH_DIFFS[args.path](); break; } result = `diff --git a/${args.path ?? 'src/components/search.ts'} b/${args.path ?? 'src/components/search.ts'}\nindex 64d221a..0e6c9ef 100644\n--- a/${args.path ?? 'src/components/search.ts'}\n+++ b/${args.path ?? 'src/components/search.ts'}\n@@ -12,5 +12,6 @@ export function mountSearch(items) {\n+  const index = createSearchIndex(items);\n+\n   input.addEventListener("input", () => {\n-    const index = createSearchIndex(items);\n-    renderAll(index.search(input.value));\n+    renderResults(index.search(input.value));\n   });\n }`; break;
     case 'git_stage': checkoutGit(args.sessionId).files.forEach(file => { if (args.paths.includes(file.path)) { file.index = args.staged ? 'M' : ' '; file.working = args.staged ? ' ' : 'M'; } }); break;
     case 'git_commit': {
       const checkout = checkoutGit(args.sessionId);

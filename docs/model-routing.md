@@ -73,6 +73,39 @@ lead's own model (in a named team without the lead's model, the team's first
 model) and the dispatch note says "not routed (routing is off)". `route_models`
 and **Route** return a "routing is off" error.
 
+Whole providers and individual provider/model pairs can be switched off for orchestration. These choices are saved separately in `routing-exclusions.json` beside the routing settings and exclude models from Panda Router, the lead's roster and harness failover. Profiles and the unrouted fallback never staff a switched-off or paused model (a profileId naming one is refused); if no roster model is usable, the lead sees an empty roster with a note and workers use the lead's own model. Explicitly naming a provider and model in an automatic team still dispatches it. Only harness failures (the CLI missing or failing to start, session errors, auth, rate limits, crashes) pause a model; PandaCode's own preflight errors do not. A follow-up resets a worker's failover count.
+
+## Tier list
+
+Users can rank models S, A, B, C or D. A ranked model's tier is the major weight in every
+routing decision; unranked models route exactly as before. Saved in `routing-tiers.json`
+beside the exclusions (written atomically; invalid entries are dropped one by one on load).
+
+- Each tier is an ability on the cards' 1–10 scale (`Tier::ability` in
+  `panda_router/tiers.rs`): S 8.9 (the strongest cards, Fable 5.1 and Opus 5.5), A 8.0,
+  B 7.0, C 6.0, D 4.5 (small local models).
+- With `TIER_WEIGHT` = 0.7, a ranked card's mean ability (so P at every level and the
+  escalation posterior) is `0.7·tier + 0.3·card`, and so is its strength (the policy's
+  tie-breaks, the ladder and the never-step-down floor after a failure).
+- The final P (success head or recentred card P) moves 70% of the way to the P of the
+  tier's own ability, put on the head's scale for the task by the covered cards' mean
+  logit shift, so an S-ranked weak card beats a D-ranked strong one. A rank is not an
+  override: an unranked card whose own P beats the tier's P still wins.
+- Keys are the card id for rated models (one rank covers every harness running that
+  card) and `<provider>/<model>` for unrated ones. A ranked unrated model becomes routable
+  through a synthetic card: the tier on every axis, se 1.0, the catalog-wide median
+  discrimination and paid cost (fixed, so toggling other models never moves it), tools on.
+  Its `cardId` is its key. A rated card with no card-id rank still takes a rank saved under
+  one of its entries' `<provider>/<model>` keys (ranked before it gained a card).
+- Routes carry `tier` and `tierP` (the tier's P before the blend) on ranked models (`model_routing_route`, `route_models`) and the
+  staffing note says `tier S`.
+
+IPC: `model_routing_tiers() -> {[key]: "S"|"A"|"B"|"C"|"D"}`; `model_routing_set_tiers({tiers})`
+returns the same (at most 1000 entries, keys 1–300 bytes with no NUL);
+`model_routing_tier_models({pool: PoolEntry[]}) -> [{key, name, cardId|null, providers, rated}]`,
+one row per key in pool order, named after its first entry without the trailing
+` · <harness>`; `default` entries that resolve to no card are left out.
+
 ## In teams
 
 - In an automatic team, the lead sets `profileId: "auto"` on an assignment in
@@ -92,6 +125,14 @@ and **Route** return a "routing is off" error.
   on the cheapest safe model; verify each routed result; on failure dispatch a
   replacement with `replaces` and `auto`, at most 2 retries, then report.
 - Named agent teams route only within their own roster.
+- Long catalogs are limited (`teamModels` in `src/team-catalog.ts`, pure part `limitTeamModels`, tested in
+  `tests/team-catalog.test.mjs`): a harness with more than 10 models besides `default` (OpenCode without a saved
+  Settings selection, Devin, Kilo…) offers teams only its 10 most recently used models (tasks by last prompt, then
+  the model picker's `pandacode.recent-models.<harness>`) plus the models added for teams
+  (`pandacode.team-models.added.<harness>`, at most 50). The same set feeds the team catalog sent to
+  `architect_configure`, Models for teams ("Showing N of M models · Add model…") and Rank models (whose Add model…
+  asks for the harness first); both open `src/team-model-add.ts`, a searchable list where recent models are
+  always on and the others toggle the added list. A ranked model that leaves the set keeps its tier, unshown.
 - When you name models in your message, the lead uses those.
 
 ## Privacy
@@ -135,3 +176,9 @@ network request.
   cargo test --lib live_team_routing -- --ignored --nocapture` prints each pick, its
   ladder and two escalation steps (`PANDA_ROUTER_MODE=cheapest|quality`).
 - `src/model-routing.ts`: the settings panel.
+
+## Unavailable models and failover
+
+Every run's own outcome feeds `src-tauri/src/model_health.rs`. A harness error pauses that model on that harness for 10 minutes, doubling with each further failure up to 2 hours; a team worker that goes silent counts the same. User stops and PandaCode's own failures (launch, saving) do not. Two paused models on one harness pause the whole harness until it has a successful run. Pauses are saved in `model-health.json` in app data. Paused models never reach Panda Router (`route_jobs`, `model_routing_route`) or the lead's roster. When a team worker's run fails and the same model (same card, or the same model ID if it is unrated) runs on another healthy harness in the team's pool, the worker moves there on a fresh session and is queued again. This counts toward `routing::MAX_ATTEMPTS`, and the lead sees a `Failover:` note. Settings → Model routing lists paused models; Allow now lifts a pause.
+
+Leads route first: an assignment with no profileId, provider or model is routed like `auto` while routing is on. The lead's own model is the last resort, and a lead picks a model only when the user names one.

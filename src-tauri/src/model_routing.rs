@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::panda_router::{self, Mode, PoolModel, Preferences, Route, Router, TaskContext};
+use crate::panda_router::{self, Mode, PoolModel, Preferences, Route, Router, TaskContext, Tier, Tiers};
 
 const SETTINGS_FILE: &str = "model-routing.json";
 /// Profiler files of earlier releases, removed once the current ones load.
@@ -79,22 +79,316 @@ pub(crate) fn write_settings(path: &Path, settings: &Settings) -> Result<(), Str
     std::fs::rename(&temp, path).map_err(|e| format!("Could not save model routing settings: {e}"))
 }
 
+const EXCLUSIONS_FILE: &str = "routing-exclusions.json";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExcludedModel {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Exclusions {
+    pub providers: Vec<String>,
+    pub models: Vec<ExcludedModel>,
+}
+
+impl Exclusions {
+    fn validated(mut self) -> Result<Self, String> {
+        if self.providers.len() > 64 || self.models.len() > MAX_POOL {
+            return Err("Exclude at most 64 providers and 1000 models.".into());
+        }
+        for provider in self.providers.iter().chain(self.models.iter().map(|m| &m.provider)) {
+            if !crate::architect::HARNESSES.contains(&provider.as_str()) {
+                return Err(format!("Unknown harness {provider:?}."));
+            }
+        }
+        if self.models.iter().any(|m| m.model.is_empty() || m.model.len() > 200 || m.model.contains('\0')) {
+            return Err("Model IDs must be 1–200 bytes with no NUL.".into());
+        }
+        let mut providers = std::collections::HashSet::new();
+        self.providers.retain(|p| providers.insert(p.clone()));
+        let mut models = std::collections::HashSet::new();
+        self.models.retain(|m| models.insert((m.provider.clone(), m.model.clone())));
+        Ok(self)
+    }
+
+    fn allowed(&self, provider: &str, model: &str) -> bool {
+        !self.providers.iter().any(|p| p == provider)
+            && !self.models.iter().any(|m| m.provider == provider && m.model == model)
+    }
+}
+
+fn read_exclusions(path: &Path) -> Exclusions {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Exclusions>(&bytes).ok())
+        // Drop entries this version no longer accepts (a removed harness) rather than the whole file.
+        .map(|mut e| {
+            e.providers.retain(|p| crate::architect::HARNESSES.contains(&p.as_str()));
+            e.models.retain(|m| crate::architect::HARNESSES.contains(&m.provider.as_str()) && !m.model.is_empty() && m.model.len() <= 200 && !m.model.contains('\0'));
+            e.providers.truncate(64);
+            e.models.truncate(MAX_POOL);
+            e
+        })
+        .and_then(|e| e.validated().ok())
+        .unwrap_or_default()
+}
+
+fn write_exclusions(path: &Path, exclusions: &Exclusions) -> Result<(), String> {
+    let temp = path.with_extension("json.tmp");
+    let json = serde_json::to_vec_pretty(exclusions).map_err(|e| e.to_string())?;
+    std::fs::write(&temp, json).map_err(|e| format!("Could not save routing exclusions: {e}"))?;
+    std::fs::rename(&temp, path).map_err(|e| format!("Could not save routing exclusions: {e}"))
+}
+
+const TIERS_FILE: &str = "routing-tiers.json";
+const MAX_TIER_KEY: usize = 300;
+
+fn tier_key_ok(key: &str) -> bool {
+    !key.is_empty() && key.len() <= MAX_TIER_KEY && !key.contains('\0')
+}
+
+fn validate_tiers(tiers: Tiers) -> Result<Tiers, String> {
+    if tiers.len() > MAX_POOL {
+        return Err(format!("Rank at most {MAX_POOL} models."));
+    }
+    if !tiers.keys().all(|k| tier_key_ok(k)) {
+        return Err(format!("Tier keys must be 1–{MAX_TIER_KEY} bytes with no NUL."));
+    }
+    Ok(tiers)
+}
+
+/// Invalid entries (bad key or tier) are dropped one by one, never the whole file.
+fn read_tiers(path: &Path) -> Tiers {
+    let Some(raw) = std::fs::read(path).ok().and_then(|b| serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&b).ok()) else {
+        return Tiers::new();
+    };
+    raw.into_iter()
+        .filter(|(k, _)| tier_key_ok(k))
+        .filter_map(|(k, v)| serde_json::from_value::<Tier>(v).ok().map(|t| (k, t)))
+        .take(MAX_POOL)
+        .collect()
+}
+
+fn write_tiers(path: &Path, tiers: &Tiers) -> Result<(), String> {
+    let temp = path.with_extension("json.tmp");
+    let sorted: std::collections::BTreeMap<_, _> = tiers.iter().collect();
+    let json = serde_json::to_vec_pretty(&sorted).map_err(|e| e.to_string())?;
+    std::fs::write(&temp, json).map_err(|e| format!("Could not save model tiers: {e}"))?;
+    std::fs::rename(&temp, path).map_err(|e| format!("Could not save model tiers: {e}"))
+}
+
+#[cfg(test)]
+thread_local!(static TEST_TIERS: std::cell::RefCell<Option<Tiers>> = const { std::cell::RefCell::new(None) });
+
+#[cfg(test)]
+pub(crate) fn with_tiers<T>(tiers: Tiers, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Tiers>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_TIERS.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(TEST_TIERS.with(|slot| slot.replace(Some(tiers))));
+    f()
+}
+
+/// The user's tier list (empty before setup).
+pub fn tiers() -> Tiers {
+    #[cfg(test)]
+    if let Some(tiers) = TEST_TIERS.with(|slot| slot.borrow().clone()) {
+        return tiers;
+    }
+    RUNTIME.get().and_then(|rt| rt.tiers.lock().ok().map(|t| t.clone())).unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn model_routing_tiers() -> Result<Tiers, String> {
+    runtime()?.tiers.lock().map(|t| t.clone()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn model_routing_set_tiers(tiers: Tiers) -> Result<Tiers, String> {
+    let next = validate_tiers(tiers)?;
+    let rt = runtime()?;
+    let mut current = rt.tiers.lock().map_err(|e| e.to_string())?;
+    write_tiers(&rt.root.join(TIERS_FILE), &next)?;
+    *current = next.clone();
+    Ok(next)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TierModel {
+    pub key: String,
+    pub name: String,
+    pub card_id: Option<String>,
+    pub providers: Vec<String>,
+    pub rated: bool,
+}
+
+/// A pool entry's display name without its trailing ` · <harness name>`.
+fn display_name(e: &PoolEntry) -> &str {
+    let harness = crate::providers::PROVIDERS.iter().find(|(id, _)| *id == e.provider).map(|(_, name)| *name);
+    harness.and_then(|h| e.name.strip_suffix(h)).and_then(|n| n.strip_suffix(" · ")).unwrap_or(&e.name).trim()
+}
+
+/// The rankable models of a pool, one per tier key, in pool order, named after their first entry. A
+/// `default` entry that names no card is left out: there is nothing stable to rank.
+pub fn tier_models(pool: &[PoolEntry]) -> Vec<TierModel> {
+    let mut out: Vec<TierModel> = Vec::new();
+    for e in pool {
+        let (key, card) = panda_router::tier_key(&e.provider, &e.model, &e.name);
+        if card.is_none() && e.model == "default" {
+            continue;
+        }
+        if let Some(existing) = out.iter_mut().find(|m| m.key == key) {
+            if !existing.providers.contains(&e.provider) {
+                existing.providers.push(e.provider.clone());
+            }
+            continue;
+        }
+        let name = match display_name(e) {
+            "" => card.unwrap_or(&e.model).to_string(),
+            name => name.to_string(),
+        };
+        out.push(TierModel { key, name, card_id: card.map(String::from), providers: vec![e.provider.clone()], rated: card.is_some() });
+    }
+    out
+}
+
+/// Moves ranks saved under `<provider>/<model>` (while a model had no card) onto its card's key, so the
+/// ranker shows the rank the router applies. A card-key rank wins; the legacy one is dropped. None if
+/// nothing moved.
+fn canonical_tiers(pool: &[PoolEntry], tiers: &Tiers) -> Option<Tiers> {
+    let mut next = tiers.clone();
+    for e in pool {
+        let legacy = format!("{}/{}", e.provider, e.model);
+        let (key, card) = panda_router::tier_key(&e.provider, &e.model, &e.name);
+        if card.is_none() || key == legacy {
+            continue;
+        }
+        if let Some(tier) = next.remove(&legacy) {
+            next.entry(key).or_insert(tier);
+        }
+    }
+    (next != *tiers).then_some(next)
+}
+
+#[tauri::command]
+pub fn model_routing_tier_models(pool: Vec<PoolEntry>) -> Result<Vec<TierModel>, String> {
+    validate_pool(&pool)?;
+    let rt = runtime()?;
+    let mut current = rt.tiers.lock().map_err(|e| e.to_string())?;
+    if let Some(next) = canonical_tiers(&pool, &current) {
+        write_tiers(&rt.root.join(TIERS_FILE), &next)?;
+        *current = next;
+    }
+    Ok(tier_models(&pool))
+}
+
+#[cfg(test)]
+thread_local!(static TEST_EXCLUSIONS: std::cell::RefCell<Option<Exclusions>> = const { std::cell::RefCell::new(None) });
+
+#[cfg(test)]
+pub(crate) fn with_exclusions<T>(exclusions: Exclusions, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Exclusions>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_EXCLUSIONS.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(TEST_EXCLUSIONS.with(|slot| slot.replace(Some(exclusions))));
+    f()
+}
+
+pub fn allowed(provider: &str, model: &str) -> bool {
+    #[cfg(test)]
+    if let Some(allowed) = TEST_EXCLUSIONS.with(|slot| slot.borrow().as_ref().map(|e| e.allowed(provider, model))) {
+        return allowed;
+    }
+    RUNTIME.get().is_none_or(|rt| rt.exclusions.lock().unwrap_or_else(|e| e.into_inner()).allowed(provider, model))
+}
+
+fn available(pool: Vec<PoolModel>) -> Vec<PoolModel> {
+    crate::model_health::healthy(pool.into_iter().filter(|m| allowed(&m.provider, &m.model)).collect())
+}
+
+#[tauri::command]
+pub fn model_routing_exclusions() -> Result<Exclusions, String> {
+    runtime()?.exclusions.lock().map(|e| e.clone()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn model_routing_set_exclusions(providers: Vec<String>, models: Vec<ExcludedModel>) -> Result<Exclusions, String> {
+    let next = Exclusions { providers, models }.validated()?;
+    let rt = runtime()?;
+    let mut exclusions = rt.exclusions.lock().map_err(|e| e.to_string())?;
+    write_exclusions(&rt.root.join(EXCLUSIONS_FILE), &next)?;
+    *exclusions = next.clone();
+    Ok(next)
+}
+
 #[cfg(target_os = "macos")]
 const MIN_MACOS: (u32, u32) = (13, 4);
 
 struct Runtime {
     root: PathBuf,
     settings: Mutex<Settings>,
+    exclusions: Mutex<Exclusions>,
+    tiers: Mutex<Tiers>,
     error: Mutex<Option<String>>,
     downloading: AtomicBool,
     /// Finished download attempts; a caller that waited on another's attempt shares its result.
     attempts: AtomicU64,
     download: tokio::sync::Mutex<()>,
     failed_at: Mutex<Option<Instant>>,
-    onnx: tokio::sync::OnceCell<Arc<Router>>,
+    /// The loaded ONNX router and when it last routed; dropped after `IDLE_UNLOAD`, reloaded on use.
+    onnx: tokio::sync::Mutex<Option<Loaded>>,
     /// Verified files that ONNX Runtime still could not load: keyword heuristic for the rest of
     /// this process, with no re-downloads.
     unusable: OnceLock<String>,
+}
+
+struct Loaded {
+    router: Arc<Router>,
+    used: Instant,
+}
+
+/// The profiler (session + tokenizer, tens of MB) is freed after this long without a route.
+const IDLE_UNLOAD: Duration = Duration::from_secs(10 * 60);
+
+/// Drops an idle router; otherwise returns how long until it could be idle.
+fn unload_if_idle(slot: &mut Option<Loaded>, now: Instant) -> Option<Duration> {
+    let idle = now.saturating_duration_since(slot.as_ref()?.used);
+    if idle >= IDLE_UNLOAD {
+        *slot = None;
+        return None;
+    }
+    Some(IDLE_UNLOAD - idle)
+}
+
+fn touch(slot: &mut Option<Loaded>) -> Option<Arc<Router>> {
+    let loaded = slot.as_mut()?;
+    loaded.used = Instant::now();
+    Some(loaded.router.clone())
+}
+
+/// One sleeping task per load: wakes when the router could be idle and drops it if it is.
+fn watch_idle(rt: &'static Runtime) {
+    tauri::async_runtime::spawn(async move {
+        let mut wait = IDLE_UNLOAD;
+        loop {
+            tokio::time::sleep(wait).await;
+            match unload_if_idle(&mut *rt.onnx.lock().await, Instant::now()) {
+                Some(left) => wait = left,
+                None => break,
+            }
+        }
+    });
 }
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -105,12 +399,14 @@ pub fn setup(app_data: &Path) {
     let _ = RUNTIME.set(Runtime {
         root: app_data.to_path_buf(),
         settings: Mutex::new(settings),
+        exclusions: Mutex::new(read_exclusions(&app_data.join(EXCLUSIONS_FILE))),
+        tiers: Mutex::new(read_tiers(&app_data.join(TIERS_FILE))),
         error: Mutex::new(None),
         downloading: AtomicBool::new(false),
         attempts: AtomicU64::new(0),
         download: tokio::sync::Mutex::new(()),
         failed_at: Mutex::new(None),
-        onnx: tokio::sync::OnceCell::new(),
+        onnx: tokio::sync::Mutex::new(None),
         unusable: OnceLock::new(),
     });
 }
@@ -330,8 +626,8 @@ fn macos_supported(version: &str) -> bool {
 /// The ONNX router when its files are here (loaded once), else the heuristic. A missing profiler
 /// downloads in the background; only `wait` (Settings' Try it) waits for it, up to `DOWNLOAD_WAIT`.
 async fn router(rt: &'static Runtime, wait: bool) -> Arc<Router> {
-    if let Some(router) = rt.onnx.get() {
-        return router.clone();
+    if let Some(router) = touch(&mut *rt.onnx.lock().await) {
+        return router;
     }
     if rt.unusable.get().is_some() {
         return HEURISTIC.clone();
@@ -350,20 +646,25 @@ async fn router(rt: &'static Runtime, wait: bool) -> Arc<Router> {
             return HEURISTIC.clone();
         }
     }
-    let loaded = rt
-        .onnx
-        .get_or_try_init(|| async {
-            let dir = dir.clone();
-            let router = tokio::task::spawn_blocking(move || Router::load(&dir)).await.map_err(|e| e.to_string())??;
-            Ok::<_, String>(Arc::new(router))
-        })
-        .await;
+    // Single flight: a concurrent caller that loaded it meanwhile wins.
+    let mut slot = rt.onnx.lock().await;
+    if let Some(router) = touch(&mut slot) {
+        return router;
+    }
+    let load_dir = dir.clone();
+    let loaded = match tokio::task::spawn_blocking(move || Router::load(&load_dir)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    };
     match loaded {
         Ok(router) => {
             for old in OLD_ASSET_DIRS {
                 let _ = std::fs::remove_dir_all(rt.root.join(old));
             }
-            router.clone()
+            let router = Arc::new(router);
+            *slot = Some(Loaded { router: router.clone(), used: Instant::now() });
+            watch_idle(rt);
+            router
         }
         // `read_verified` reports bad or unreadable files this way; anything else is ONNX Runtime.
         Err(error) if error.contains("sha256") || error.contains("cannot read") => {
@@ -393,9 +694,10 @@ pub struct Job {
 }
 
 /// Routes every job over `pool`, one at a time: padded ONNX batches drift slightly from single
-/// routes (int8 activation scaling), and a single route takes milliseconds.
+/// routes (int8 activation scaling), and a single route takes milliseconds. Uses the user's tier list.
 pub fn route_with(router: &Router, prefs: &Preferences, pool: &[PoolModel], jobs: Vec<Job>) -> Result<Vec<Route>, String> {
-    jobs.iter().map(|j| router.route(&j.text, &j.ctx, pool, prefs, &j.failed)).collect()
+    let tiers = tiers();
+    jobs.iter().map(|j| router.route(&j.text, &j.ctx, pool, prefs, &j.failed, &tiers)).collect()
 }
 
 /// Routes for teams. None while routing is off.
@@ -405,7 +707,7 @@ pub async fn route_jobs(pool: Vec<PoolModel>, jobs: Vec<Job>, mode: Option<Mode>
     if !settings.enabled {
         return None;
     }
-    Some(run(rt, settings.preferences(mode), pool, jobs, false).await)
+    Some(run(rt, settings.preferences(mode), available(pool), jobs, false).await)
 }
 
 async fn run(rt: &'static Runtime, prefs: Preferences, pool: Vec<PoolModel>, jobs: Vec<Job>, wait: bool) -> Result<Vec<Route>, String> {
@@ -430,9 +732,16 @@ pub fn pool_from<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str, &'a st
         .collect()
 }
 
-/// Distinct cards a pool resolves to: the models routing can actually rate.
+/// Distinct cards a pool resolves to, plus ranked models without one: the models routing can rate.
 pub fn rated_count(pool: &[PoolModel]) -> usize {
-    let mut cards: Vec<_> = pool.iter().filter_map(|m| panda_router::resolve_card(&m.provider, &m.model, &m.name)).collect();
+    let tiers = tiers();
+    let mut cards: Vec<_> = pool
+        .iter()
+        .filter_map(|m| match panda_router::tier_key(&m.provider, &m.model, &m.name) {
+            (key, None) if !tiers.contains_key(&key) => None,
+            (key, _) => Some(key),
+        })
+        .collect();
     cards.sort_unstable();
     cards.dedup();
     cards.len()
@@ -552,7 +861,7 @@ pub async fn model_routing_route(text: String, pool: Vec<PoolEntry>) -> Result<R
         return Err(format!("Describe the task in 1–{} KB.", MAX_TEXT / 1024));
     }
     validate_pool(&pool)?;
-    let pool = pool_from(pool.iter().map(|e| (e.provider.as_str(), e.model.as_str(), e.name.as_str())));
+    let pool = available(pool_from(pool.iter().map(|e| (e.provider.as_str(), e.model.as_str(), e.name.as_str()))));
     // Same context as a team dispatch, so Try it shows the pick a worker would get.
     let job = Job { text, ctx: TaskContext { requires_tools: true, ..TaskContext::default() }, failed: vec![] };
     let prefs = rt.settings().preferences(None);
@@ -600,6 +909,149 @@ mod tests {
     }
 
     #[test]
+    fn exclusions_round_trip_and_validation() {
+        let dir = std::env::temp_dir().join(format!("pandacode-exclusions-{}", crate::storage::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(EXCLUSIONS_FILE);
+        assert_eq!(read_exclusions(&path), Exclusions::default());
+        let model = |provider: &str, model: &str| ExcludedModel { provider: provider.into(), model: model.into() };
+        let saved = Exclusions {
+            providers: vec!["commandcode".into(), "commandcode".into()],
+            models: vec![model("codex", "gpt-5.6-luna"), model("codex", "gpt-5.6-luna")],
+        }.validated().unwrap();
+        assert_eq!(saved.providers, ["commandcode"]);
+        assert_eq!(saved.models.len(), 1);
+        write_exclusions(&path, &saved).unwrap();
+        assert_eq!(read_exclusions(&path), saved);
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(serde_json::to_value(&saved).unwrap(), serde_json::json!({"providers":["commandcode"],"models":[{"provider":"codex","model":"gpt-5.6-luna"}]}));
+        for bad in [
+            Exclusions { providers: vec!["unknown".into()], models: vec![] },
+            Exclusions { providers: vec!["claude".into(); 65], models: vec![] },
+            Exclusions { providers: vec![], models: vec![model("unknown", "m")] },
+            Exclusions { providers: vec![], models: vec![model("codex", "")] },
+            Exclusions { providers: vec![], models: vec![model("codex", "a\0b")] },
+            Exclusions { providers: vec![], models: vec![model("codex", &"é".repeat(101))] },
+            Exclusions { providers: vec![], models: vec![model("codex", "m"); 1001] },
+        ] {
+            assert!(bad.validated().is_err());
+        }
+        assert!(Exclusions { providers: vec!["claude".into(); 64], models: vec![model("codex", &"é".repeat(100)); 1000] }.validated().is_ok());
+        with_exclusions(saved.clone(), || {
+            assert!(!allowed("commandcode", "anything"));
+            assert!(!allowed("codex", "gpt-5.6-luna"));
+            assert!(allowed("codex", "gpt-6-luna"));
+            assert!(allowed("claude", "gpt-5.6-luna"));
+            let pool = available(pool_from([("commandcode", "opus", "Opus"), ("codex", "gpt-5.6-luna", "Luna"), ("claude", "sonnet", "Sonnet")]));
+            assert_eq!(pool.len(), 1);
+            assert_eq!(pool[0].provider, "claude");
+        });
+        std::fs::write(&path, "invalid").unwrap();
+        assert_eq!(read_exclusions(&path), Exclusions::default());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tiers_round_trip_and_validation() {
+        let dir = std::env::temp_dir().join(format!("pandacode-tiers-{}", crate::storage::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(TIERS_FILE);
+        assert!(read_tiers(&path).is_empty());
+        let saved: Tiers = [("claude-opus-5.5".to_string(), Tier::S), ("opencode/acme/x".to_string(), Tier::D)].into();
+        let saved = validate_tiers(saved).unwrap();
+        write_tiers(&path, &saved).unwrap();
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(read_tiers(&path), saved);
+        assert_eq!(serde_json::to_value(&saved).unwrap(), serde_json::json!({"claude-opus-5.5":"S","opencode/acme/x":"D"}));
+        // Bad entries go one by one; the rest of the file stays.
+        let long = "k".repeat(301);
+        std::fs::write(&path, format!(r#"{{"a":"S","b":"E","":"A","c\u0000d":"B","{long}":"C","e":3,"f":"d","g":"D"}}"#)).unwrap();
+        assert_eq!(read_tiers(&path), [("a".to_string(), Tier::S), ("g".to_string(), Tier::D)].into());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_tiers(&path).is_empty());
+        assert!(validate_tiers([("".to_string(), Tier::S)].into()).is_err());
+        assert!(validate_tiers([("a\0b".to_string(), Tier::S)].into()).is_err());
+        assert!(validate_tiers([(long.clone(), Tier::S)].into()).is_err());
+        assert!(validate_tiers([("é".repeat(150), Tier::S)].into()).is_ok());
+        assert!(validate_tiers((0..1001).map(|i| (i.to_string(), Tier::A)).collect()).is_err());
+        assert!(validate_tiers((0..1000).map(|i| (i.to_string(), Tier::A)).collect()).is_ok());
+        assert!(serde_json::from_str::<Tiers>(r#"{"a":"E"}"#).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_ranks_move_to_their_card_key() {
+        let entry = |p: &str, m: &str| PoolEntry { provider: p.into(), model: m.into(), name: m.into() };
+        let pool = [entry("commandcode", "claude-opus-5-5"), entry("opencode", "x/mystery")];
+        let (card, _) = panda_router::tier_key("commandcode", "claude-opus-5-5", "claude-opus-5-5");
+        let saved: Tiers = [("commandcode/claude-opus-5-5".to_string(), Tier::A), ("opencode/x/mystery".to_string(), Tier::B)].into();
+        let next = canonical_tiers(&pool, &saved).unwrap();
+        assert_eq!(next, [(card.clone(), Tier::A), ("opencode/x/mystery".to_string(), Tier::B)].into());
+        assert!(canonical_tiers(&pool, &next).is_none());
+        // A rank already on the card key wins.
+        let both: Tiers = [(card.clone(), Tier::S), ("commandcode/claude-opus-5-5".to_string(), Tier::D)].into();
+        assert_eq!(canonical_tiers(&pool, &both).unwrap(), [(card, Tier::S)].into());
+    }
+
+    #[test]
+    fn tier_models_share_one_key_per_card() {
+        let entry = |p: &str, m: &str, n: &str| PoolEntry { provider: p.into(), model: m.into(), name: n.into() };
+        let models = tier_models(&[
+            entry("claude", "opus", "Opus"),
+            entry("opencode", "x/mystery", "Mystery"),
+            entry("commandcode", "claude-opus-5-5", "Opus via Command Code"),
+            entry("opencode", "x/mystery", "Mystery again"),
+            entry("kimi", "x/mystery", ""),
+        ]);
+        let json = serde_json::to_value(&models).unwrap();
+        assert_eq!(json[0]["key"], "claude-opus-5.5");
+        assert_eq!(json[0]["name"], "Opus");
+        assert_eq!(json[0]["cardId"], "claude-opus-5.5");
+        assert_eq!(json[0]["providers"], serde_json::json!(["claude", "commandcode"]));
+        assert_eq!(json[0]["rated"], true);
+        assert_eq!(json[1], serde_json::json!({"key":"opencode/x/mystery","name":"Mystery","cardId":null,"providers":["opencode"],"rated":false}));
+        assert_eq!(json[2]["name"], "x/mystery");
+        assert_eq!(models.len(), 3);
+        // Ranked unrated models count as routable; unranked ones do not.
+        let pool = pool_from([("opencode", "x/mystery", "Mystery")]);
+        assert_eq!(rated_count(&pool), 0);
+        with_tiers([("opencode/x/mystery".to_string(), Tier::A)].into(), || {
+            assert_eq!(rated_count(&pool), 1);
+            let job = Job { text: "Fix a bug".into(), ctx: TaskContext::default(), failed: vec![] };
+            let route = route_with(&Router::heuristic(), &Settings::default().preferences(None), &pool, vec![job]).unwrap().remove(0);
+            let json = serde_json::to_value(&route).unwrap();
+            assert_eq!((json["pick"]["model"].as_str(), json["pick"]["tier"].as_str()), (Some("x/mystery"), Some("A")));
+        });
+    }
+
+    #[test]
+    fn tier_models_name_entries_and_hide_unresolved_defaults() {
+        let entry = |p: &str, m: &str, n: &str| PoolEntry { provider: p.into(), model: m.into(), name: n.into() };
+        let models = tier_models(&[
+            entry("claude", "default", "Default · Claude Opus 5.5 · Claude Code"),
+            entry("grok", "default", "Default"),
+            entry("codex", "default", "Default · GPT-6 Luna · Codex"),
+            entry("claude", "opus", "Opus · Claude Code"),
+            entry("opencode", "acme/x", "Acme X · OpenCode"),
+            entry("opencode", "acme/y", ""),
+            entry("kimi", "k3", "K3 · Codex"),
+        ]);
+        let rows: Vec<_> = models.iter().map(|m| (m.key.as_str(), m.name.as_str(), m.providers.join(","))).collect();
+        let luna = panda_router::resolve_card("codex", "default", "Default · GPT-6 Luna · Codex");
+        let mut want = vec![("claude-opus-5.5", "Default · Claude Opus 5.5", "claude".to_string())];
+        if let Some(luna) = luna {
+            want.push((luna, "Default · GPT-6 Luna", "codex".into()));
+        }
+        want.extend([("opencode/acme/x", "Acme X", "opencode".into()), ("opencode/acme/y", "acme/y", "opencode".into())]);
+        // Only the entry's own harness name is stripped.
+        if panda_router::resolve_card("kimi", "k3", "K3 · Codex").is_none() {
+            want.push(("kimi/k3", "K3 · Codex", "kimi".into()));
+        }
+        assert_eq!(rows, want);
+        assert!(models.iter().all(|m| !m.key.ends_with("/default")));
+    }
+
+    #[test]
     fn default_entries_yield_to_concrete_models() {
         let pool = pool_from([
             ("claude", "default", "Default · Claude Opus 5.5 · Claude Code"),
@@ -642,6 +1094,19 @@ mod tests {
         assert_eq!(top_languages(paths.into_iter()), ["rust", "typescript", "go"]);
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(repo_languages(here).first().map(String::as_str), Some("rust"));
+    }
+
+    #[test]
+    fn idle_router_is_dropped_after_ten_minutes() {
+        let start = Instant::now();
+        let mut slot = Some(Loaded { router: Arc::new(Router::heuristic()), used: start });
+        assert_eq!(unload_if_idle(&mut slot, start + Duration::from_secs(60)), Some(Duration::from_secs(540)));
+        assert!(slot.is_some());
+        assert!(touch(&mut slot).is_some());
+        let used = slot.as_ref().unwrap().used;
+        assert_eq!(unload_if_idle(&mut slot, used + IDLE_UNLOAD), None);
+        assert!(slot.is_none());
+        assert_eq!(unload_if_idle(&mut slot, used), None);
     }
 
     #[test]
@@ -710,7 +1175,7 @@ mod tests {
         let short = |m: &panda_router::Routed| format!("{}:{}", m.provider, m.model);
         for (text, files) in tasks {
             let ctx = TaskContext { files_in_scope: (files > 0).then_some(files), repo_languages: langs.clone(), requires_tools: true };
-            let r = router.route(text, &ctx, &pool, &prefs, &[]).unwrap();
+            let r = router.route(text, &ctx, &pool, &prefs, &[], &Tiers::new()).unwrap();
             let pick = r.pick.as_ref().map_or("none".into(), |p| format!("{} P{:.2}/{:.2} ${:.4}", short(p), p.p_success, p.p_success_lower, p.est_cost_usd));
             let ladder: Vec<_> = r.ladder.iter().map(short).collect();
             // What a fresh `profileId: "auto"` worker gets (architect::routing::staff).
@@ -722,7 +1187,7 @@ mod tests {
             for _ in 0..2 {
                 let Some(p) = last else { break };
                 failed.push(PoolModel { provider: p.provider, model: p.model, name: p.name });
-                let e = router.route(text, &ctx, &pool, &prefs, &failed).unwrap();
+                let e = router.route(text, &ctx, &pool, &prefs, &failed, &Tiers::new()).unwrap();
                 let names: Vec<_> = failed.iter().map(|m| format!("{}:{}", m.provider, m.model)).collect();
                 println!("  after {} failed -> {} ({}, d{})", names.join(", "), e.pick.as_ref().map_or("none".into(), short), e.decided_by, e.difficulty);
                 assert!(e.pick.as_ref().is_none_or(|p| !failed.iter().any(|f| f.provider == p.provider && f.model == p.model)));

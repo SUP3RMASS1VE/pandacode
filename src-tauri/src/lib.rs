@@ -1,7 +1,9 @@
 mod agent_tools;
+mod agents_dock;
 mod agent_usage;
 mod agent_updates;
 mod agent_usage_providers;
+mod memory;
 mod app_updates;
 mod appearance;
 mod architect;
@@ -42,6 +44,7 @@ mod jev_decisions;
 mod local_servers;
 mod local_signing;
 mod message_queue;
+mod model_health;
 mod model_routing;
 mod moodboards;
 mod attachments;
@@ -95,6 +98,7 @@ struct RunningAgent {
     run_id: String,
     approvals: Arc<Mutex<HashSet<String>>>,
     pending_requests: Arc<Mutex<HashMap<String, AgentEvent>>>,
+    started_at_ms: i64,
     subagents: Arc<Mutex<subagent_state::SubagentState>>,
     assistant: Arc<Mutex<String>>,
     /// When the harness last sent anything; team watchdogs stop a turn that went silent.
@@ -108,6 +112,7 @@ impl RunningAgent {
             run_id: uuid::Uuid::new_v4().to_string(),
             approvals: Arc::new(Mutex::new(HashSet::new())),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            started_at_ms: storage::now(),
             subagents: Arc::new(Mutex::new(subagent_state::SubagentState::default())),
             assistant: Arc::new(Mutex::new(String::new())),
             last_event: Arc::new(std::sync::atomic::AtomicI64::new(storage::now())),
@@ -120,6 +125,12 @@ impl RunningAgent {
 
     pub(crate) fn has_pending_approvals(&self) -> bool {
         self.approvals.lock().map_or(true, |approvals| !approvals.is_empty())
+    }
+
+    fn waiting_for_input(&self) -> bool {
+        self.pending_requests
+            .lock()
+            .is_ok_and(|requests| requests.values().any(|request| request.kind == "input_request"))
     }
 
     fn respond_approval(
@@ -523,8 +534,13 @@ impl AppState {
     }
 }
 /// Fixed instructions for every task turn: sidebar titles, the run script, change tracking.
-/// Projectless chats have nothing to run, so they skip the run script.
-fn app_instructions(chat: bool) -> String {
+/// Projectless chats have nothing to run, so they skip the run script. Managed team workers
+/// report to their lead, not the user: no titles (they never get a title run), run script,
+/// rich questions or generative UI.
+fn app_instructions(chat: bool, worker: bool) -> String {
+    if worker {
+        return [turn_changes::instruction(), TURN_ENDS].concat();
+    }
     let run = if chat { "" } else { run_script::INSTRUCTIONS };
     [session_titles::GUIDANCE, run, turn_changes::instruction(), TURN_ENDS, RICH_QUESTIONS, GENERATIVE_UI].concat()
 }
@@ -553,12 +569,25 @@ mod instruction_tests {
         let reminded: Vec<i64> = (1..=20).filter(|turn| reminder_turn(*turn)).collect();
         assert_eq!(reminded, [1, 9, 17]);
         assert!(!reminder_turn(0));
-        let text = app_instructions(false);
+        let text = app_instructions(false, false);
         for part in ["Sidebar titles:", "Run and preview workflow:", "File change tracking:", "Questions you ask through the request_user_input tool", "Your turn ends when you reply", "Generative UI:"] {
             assert!(text.contains(part), "{part}");
         }
-        let chat = app_instructions(true);
+        let chat = app_instructions(true, false);
         assert!(!chat.contains("Run and preview workflow:") && chat.contains("Sidebar titles:"));
+    }
+
+    #[test]
+    fn team_workers_get_only_change_tracking_and_turn_end() {
+        let lead = app_instructions(false, false);
+        let worker = app_instructions(false, true);
+        assert_eq!(lead, [session_titles::GUIDANCE, run_script::INSTRUCTIONS, turn_changes::instruction(), TURN_ENDS, RICH_QUESTIONS, GENERATIVE_UI].concat());
+        assert_eq!(worker, [turn_changes::instruction(), TURN_ENDS].concat());
+        assert!(worker.contains("File change tracking:") && worker.contains("Your turn ends when you reply"));
+        for gone in ["Sidebar titles:", "Run and preview workflow:", "Generative UI:", "request_user_input"] {
+            assert!(!worker.contains(gone), "{gone}");
+        }
+        eprintln!("app instructions: lead {} B, worker {} B", lead.len(), worker.len());
     }
 }
 
@@ -1010,6 +1039,38 @@ fn flush_assistant(db: &Store, sid: &str, assistant: &Mutex<String>) -> Result<(
         text.clear();
     }
     Ok(())
+}
+
+/// Streams an agent event to the window and remote viewers, merging text deltas
+/// (`providers::Coalescer`). The lock is held while emitting so order is kept.
+fn emit_coalesced(app: &tauri::AppHandle, coalescer: &Arc<Mutex<providers::Coalescer>>, event: AgentEvent) {
+    let mut buffer = coalescer.lock().unwrap_or_else(|poison| poison.into_inner());
+    let now = std::time::Instant::now();
+    for event in buffer.push(event, now) {
+        remote::agent_event(app, &event);
+        let _ = app.emit("agent-event", event);
+    }
+    if buffer.started_at() == Some(now) {
+        let (app, coalescer) = (app.clone(), coalescer.clone());
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(providers::COALESCE_WINDOW).await;
+            let mut buffer = coalescer.lock().unwrap_or_else(|poison| poison.into_inner());
+            if buffer.started_at() == Some(now) {
+                if let Some(event) = buffer.flush() {
+                    remote::agent_event(&app, &event);
+                    let _ = app.emit("agent-event", event);
+                }
+            }
+        });
+    }
+}
+
+fn flush_coalesced(app: &tauri::AppHandle, coalescer: &Arc<Mutex<providers::Coalescer>>) {
+    let mut buffer = coalescer.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(event) = buffer.flush() {
+        remote::agent_event(app, &event);
+        let _ = app.emit("agent-event", event);
+    }
 }
 
 fn save_agent_activity(
@@ -1816,7 +1877,8 @@ async fn launch_operation_admitted(
         config.prompt.push_str(&title.instruction());
     }
     if restore_stage.is_none() {
-        let instructions = app_instructions(chats::is_chat_folder(&config.cwd));
+        let worker = team.as_ref().is_some_and(|admission| admission.parent != session_id);
+        let instructions = app_instructions(chats::is_chat_folder(&config.cwd), worker);
         if providers::takes_system_instructions(&config.provider) {
             // Cached with the system prompt: paid once, then read at a tenth of the price.
             config.instructions = instructions;
@@ -1865,6 +1927,8 @@ async fn launch_operation_admitted(
         let goal_agents_sink = agents.clone();
         let native_turn_sink = Mutex::new(String::new());
         let team_sink = team.clone();
+        let coalescer = Arc::new(Mutex::new(providers::Coalescer::default()));
+        let coalescer_sink = coalescer.clone();
         let sink: providers::Sink = Arc::new(move |mut e: AgentEvent| {
             if cloud && app_sink.state::<AppState>().shutdown.load(Ordering::SeqCst) != 0 {
                 return;
@@ -1983,10 +2047,9 @@ async fn launch_operation_admitted(
             ) {
                 architect::activity(&app_sink, &e.session_id, team_sink.as_ref());
             }
-            remote::agent_event(&app_sink, &e);
             // Cloned only for the turn boundary below.
             let completed = (e.kind == "turn_complete").then(|| e.session_id.clone());
-            let _ = app_sink.emit("agent-event", e);
+            emit_coalesced(&app_sink, &coalescer_sink, e);
             if let Some(changes_sid) = completed {
                 if let Some(tracker) = &tracker_sink {
                     let capture = blocking_snapshot(|| {
@@ -2010,7 +2073,7 @@ async fn launch_operation_admitted(
         let team_tools_missing = team.is_some() && host.is_none();
         let host = agent_tools::with_jev(host, app.clone(), session_id.clone(), stopped.clone());
         let host = bots::tools::with_bot(host, app.clone(), session_id.clone(), stopped.clone());
-        let host = simulator::tools::with_simulator(host, app.clone(), stopped.clone());
+        let host = simulator::tools::with_simulator_for(host, app.clone(), session_id.clone(), stopped.clone());
         let host = vm::tools::with_vm(host, app.clone(), session_id.clone(), stopped.clone());
         let host = design::with_design(host, app.clone(), session_id.clone(), stopped.clone());
         let host = cloud::deploy::with_deploy(host, app.clone(), session_id.clone(), stopped.clone());
@@ -2025,6 +2088,9 @@ async fn launch_operation_admitted(
             let tools = host.as_ref().map(|host| (host.tools.clone(), host.approval_tools.clone())).unwrap_or_default();
             (config.clone(), tools)
         });
+        // The harness and model this run used, for model health.
+        let ran = (config.provider.clone(), config.model.clone());
+        let reached_harness = Arc::new(AtomicBool::new(false));
         let result = if stopped.load(Ordering::SeqCst) {
             Ok(())
         } else if team_tools_missing {
@@ -2033,8 +2099,9 @@ async fn launch_operation_admitted(
                     .into(),
             )
         } else {
-            providers::run_with_tools(config, sink, rx, host).await
+            providers::run_with_tools(config, sink, rx, host, reached_harness.clone()).await
         };
+        flush_coalesced(&app, &coalescer);
         if cloud && app.state::<AppState>().shutdown.load(Ordering::SeqCst) != 0 {
             // The remote run continues; the next launch re-attaches to it.
             if let Ok(mut registry) = agents.lock() {
@@ -2095,6 +2162,18 @@ async fn launch_operation_admitted(
         // request must not write into the next run while the team remains active.
         stopped.store(true, Ordering::SeqCst);
         let mut successful = result.is_ok() && !was_stopped;
+        // Only the harness's own outcome counts for model health (Settings → Model routing): a stop
+        // says nothing, and PandaCode's own failures before the harness (validation, attachments,
+        // connections, team tools) are not the model's.
+        let provider_error = match &result {
+            Err(error) if !was_stopped && reached_harness.load(Ordering::SeqCst) => Some(error.to_string()),
+            _ => None,
+        };
+        if let Some(error) = &provider_error {
+            model_health::record_failure(&ran.0, &ran.1, error);
+        } else if successful {
+            model_health::record_success(&ran.0, &ran.1);
+        }
         let mut children = subagents.lock().ok();
         if let Ok(db) = store.lock() {
             let child_status = if was_stopped || successful {
@@ -2213,6 +2292,9 @@ async fn launch_operation_admitted(
                 }
             }
             registry.remove(&session_id);
+            if registry.is_empty() {
+                memory::release_soon();
+            }
         }
         let done = if was_stopped {
             "Turn stopped"
@@ -2253,7 +2335,7 @@ async fn launch_operation_admitted(
         // Read before the team scheduler can start this task's next turn.
         let launch = providers::warm_epoch(&session_id);
         if let Some(registry) = registry.as_ref() {
-            architect::completed(&app, &session_id, team.as_ref(), successful, was_stopped, registry);
+            architect::completed(&app, &session_id, team.as_ref(), successful, was_stopped, provider_error.as_deref(), registry);
         }
         drop(registry);
         // Start the next turn's agent now, so a follow-up skips the CLI's own startup.
@@ -2265,7 +2347,13 @@ async fn launch_operation_admitted(
                 [&session_id],
                 |row| row.get::<_, bool>(0),
             ).ok()).unwrap_or(false);
-            let task = store.lock().ok().filter(|_| replied).and_then(|db| db.session(&session_id).ok());
+            // A lead whose workers are still unsettled is woken only after they settle, often
+            // past the spare's idle limit: skip the spare (the wake starts cold, ~1.4 s).
+            let lead = team.as_ref().is_some_and(|admission| admission.parent == session_id);
+            let waiting_on_workers = lead && store.lock().ok().and_then(|db| architect::load(&db, &session_id).ok().flatten()).is_some_and(|snapshot| {
+                snapshot.workers.iter().any(|worker| !worker.abandoned && architect::unsettled(&worker.status))
+            });
+            let task = store.lock().ok().filter(|_| replied && !waiting_on_workers).and_then(|db| db.session(&session_id).ok());
             if let Some(task) = task {
                 next.resume_id = task.resume_id;
                 next.model = task.model;
@@ -3455,6 +3543,7 @@ fn setup_common(app: &tauri::App) -> crate::Result<PathBuf> {
     provider_settings::setup(&dir)?;
     connections::setup(&dir)?;
     model_routing::setup(&dir);
+    model_health::setup(&dir);
     // Optional integration storage must never prevent the workspace from opening.
     if jev::setup(&dir).is_err() {
         eprintln!("Jev settings are unavailable; browser testing remains disabled.");
@@ -3573,6 +3662,7 @@ pub fn run() {
                 }
             });
             let dir = setup_common(app)?;
+            agents_dock::setup(app.handle(), &dir).map_err(std::io::Error::other)?;
             overlay::setup(app.handle(), &dir).map_err(std::io::Error::other)?;
             vm::watch_idle(app.handle().clone());
             if let Err(error) = tray::setup(app.handle()) {
@@ -3615,6 +3705,15 @@ pub fn run() {
                 ];
                 return handler(invoke);
             }
+            if invoke.message.webview_ref().label() == "agents-dock" {
+                let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+                    agents_dock::agents_dock_snapshot,
+                    agents_dock::agents_dock_unpin,
+                    agents_dock::agents_dock_set_expanded,
+                    agents_dock::agents_dock_open_task,
+                ];
+                return handler(invoke);
+            }
             if invoke.message.webview_ref().label() != "main" {
                 invoke
                     .resolver
@@ -3622,12 +3721,23 @@ pub fn run() {
                 return true;
             }
             let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+                agents_dock::agents_dock_snapshot,
+                agents_dock::agents_dock_preferences,
+                agents_dock::agents_dock_save_preferences,
+                agents_dock::agents_dock_pin,
                 support::open_support,
                 support::support_details,
                 model_routing::model_routing_status,
+                model_routing::model_routing_exclusions,
+                model_routing::model_routing_set_exclusions,
                 model_routing::model_routing_configure,
                 model_routing::model_routing_prepare,
                 model_routing::model_routing_route,
+                model_routing::model_routing_tiers,
+                model_routing::model_routing_set_tiers,
+                model_routing::model_routing_tier_models,
+                model_health::model_health_list,
+                model_health::model_health_clear,
                 local_sign_app,
                 app_updates::app_update_install_supported,
                 agent_updates::check_agent_updates,

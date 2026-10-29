@@ -67,12 +67,19 @@ pub(crate) mod windows_job;
 pub use subagents::SubagentActivity;
 
 const MAX_FRAME: usize = 4 * 1024 * 1024;
+/// Capacity the frame buffer keeps after a large message has been consumed.
+const FRAME_KEEP: usize = 64 * 1024;
 const MODEL_CATALOG_LIMIT: usize = 10_000;
 const STDERR_LIMIT: usize = 16 * 1024;
 const TOOL_INPUT_LIMIT: usize = 4096;
 const TOOL_OUTPUT_LIMIT: usize = 8192;
 const TOOL_CACHE_LIMIT: usize = 64;
 const PREVIEW_TRUNCATED: &str = "\n[Preview truncated]";
+
+/// A frame buffer grown past 1 MiB by one large message gives the memory back once drained.
+fn should_shrink(len: usize, capacity: usize) -> bool {
+    capacity > 1024 * 1024 && len <= FRAME_KEEP / 2
+}
 pub(crate) const PROVIDERS: [(&str, &str); 20] = [
     ("claude", "Claude Code"),
     ("codex", "Codex"),
@@ -439,6 +446,55 @@ pub enum RunInput {
     },
 }
 pub type Sink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
+/// How long streamed text may wait before it reaches the window (about one frame at 30 Hz).
+pub const COALESCE_WINDOW: Duration = Duration::from_millis(33);
+const COALESCE_BYTES: usize = 8 * 1024;
+
+/// Merges consecutive plain `text`/`thinking` deltas into one event, so a long reply is a
+/// few dozen window events instead of thousands. Any other event flushes the buffer first,
+/// so ordering is preserved.
+#[derive(Default)]
+pub struct Coalescer {
+    pending: Option<(AgentEvent, std::time::Instant)>,
+}
+impl Coalescer {
+    /// Events to emit now, in order. A buffered delta waits until the window or size limit
+    /// passes, the next event of another kind, or `flush`.
+    pub fn push(&mut self, event: AgentEvent, now: std::time::Instant) -> Vec<AgentEvent> {
+        let plain = matches!(event.kind.as_str(), "text" | "thinking")
+            && event.request_id.is_none()
+            && event.data.is_none()
+            && event.tool.is_none();
+        let mut out = Vec::new();
+        match &mut self.pending {
+            Some((buffered, _)) if plain && buffered.kind == event.kind && buffered.session_id == event.session_id => {
+                buffered.text.push_str(&event.text);
+            }
+            _ => {
+                out.extend(self.flush());
+                if !plain {
+                    out.push(event);
+                    return out;
+                }
+                self.pending = Some((event, now));
+            }
+        }
+        if self.pending.as_ref().is_some_and(|(buffered, since)| {
+            buffered.text.len() >= COALESCE_BYTES || now.duration_since(*since) >= COALESCE_WINDOW
+        }) {
+            out.extend(self.flush());
+        }
+        out
+    }
+    pub fn flush(&mut self) -> Option<AgentEvent> {
+        self.pending.take().map(|(event, _)| event)
+    }
+    /// When the buffered delta arrived; a timer flushes it only if it is still that buffer.
+    pub fn started_at(&self) -> Option<std::time::Instant> {
+        self.pending.as_ref().map(|(_, since)| *since)
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2712,18 +2768,31 @@ pub async fn run(
     sink: Sink,
     input: UnboundedReceiver<RunInput>,
 ) -> Result<(), String> {
-    run_with_tools(config, sink, input, None).await
+    run_with_tools(config, sink, input, None, Default::default()).await
 }
 
+tokio::task_local! {
+    static HARNESS: Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Marks the run as having reached the harness: from here an error is the harness's (its CLI is
+/// missing, it could not start, or its process or session failed), so it counts for model health.
+/// PandaCode's own preflight (validation, attachments, connections, tools) fails before this.
+fn reached_harness() {
+    let _ = HARNESS.try_with(|reached| reached.store(true, std::sync::atomic::Ordering::SeqCst));
+}
+
+/// `harness` is set once the run reaches the harness (`reached_harness`).
 pub async fn run_with_tools(
     config: RunConfig,
     sink: Sink,
     input: UnboundedReceiver<RunInput>,
     host: Option<ToolHost>,
+    harness: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
     let identity = Protocol::new(config.clone());
     sink(identity.event("status", "Starting agent", None));
-    let result = run_inner(config, sink.clone(), input, host).await;
+    let result = HARNESS.scope(harness, run_inner(config, sink.clone(), input, host)).await;
     if let Err(error) = &result {
         sink(identity.event("error", error.clone(), None));
     }
@@ -2859,7 +2928,10 @@ async fn run_inner(
         .as_ref()
         .and_then(|connection| connection.executable.clone())
         .or_else(|| executable(&config.provider))
-        .ok_or_else(|| format!("{} CLI is not installed or is not on PATH", config.provider))?;
+        .ok_or_else(|| {
+            reached_harness();
+            format!("{} CLI is not installed or is not on PATH", config.provider)
+        })?;
     config.cwd = external_path(&config.cwd);
     let image_blocks = attachments::load(&config.provider, &config.images).await?;
     let mut command = provider_command(&config.provider, &path)?;
@@ -3040,6 +3112,7 @@ async fn run_process_with_tools(
     let _pi_bridge = if matches!(config.provider.as_str(), "pi" | "omp") {
         Some(pi::Bridge::configure(&mut command, &config.mode, mcp.as_ref())?)
     } else { None };
+    reached_harness();
     let (mut child, mut group) = if let Some(spare) = spare {
         (spare.child, spare.group)
     } else {
@@ -3146,7 +3219,9 @@ async fn run_process_with_tools(
                     let previous_len=bytes.len();
                     bytes.extend_from_slice(&buf[..count]);
                     let mut consumed=0;
-                    for end in bytes.iter().enumerate().skip(previous_len).filter_map(|(i,b)|if *b==b'\n'{Some(i)}else{None}).collect::<Vec<_>>() {
+                    let mut scan=previous_len;
+                    while let Some(offset)=bytes[scan..].iter().position(|b|*b==b'\n') {
+                        let end=scan+offset;scan=end+1;
                         let line=&bytes[consumed..end];consumed=end+1;
                         if line.len()>MAX_FRAME{return Err("Provider sent an oversized JSON message".into());}
                         if line.iter().all(u8::is_ascii_whitespace){continue;}
@@ -3159,6 +3234,7 @@ async fn run_process_with_tools(
                         if apply_step(&mut protocol,step,&sink,&mut stdin,&mut jobs,&mut queued).await? {return Ok(());}
                     }
                     bytes.drain(..consumed);
+                    if should_shrink(bytes.len(),bytes.capacity()){bytes.shrink_to(FRAME_KEEP);}
                     if bytes.len()>MAX_FRAME{return Err("Provider output exceeded the message size limit".into());}
                 },
             }
@@ -3196,7 +3272,62 @@ async fn run_process_with_tools(
 }
 
 #[cfg(test)]
+mod coalesce_tests {
+    use super::*;
+    fn ev(kind: &str, text: &str) -> AgentEvent {
+        AgentEvent { session_id: "s".into(), kind: kind.into(), text: text.into(), request_id: None, data: None, tool: None }
+    }
+    #[test]
+    fn tiny_deltas_merge_and_flush_before_other_events() {
+        let start = std::time::Instant::now();
+        let mut c = Coalescer::default();
+        let mut out = Vec::new();
+        let mut sent = String::new();
+        for i in 0..2000 {
+            if i == 1000 {
+                let mut tool = ev("tool", "Bash");
+                tool.data = Some(json!({"id": "t1"}));
+                out.extend(c.push(tool, start));
+            }
+            let delta = format!("{}", i % 10);
+            sent.push_str(&delta);
+            // All within one 33 ms window.
+            out.extend(c.push(ev("text", &delta), start + Duration::from_micros(i)));
+        }
+        out.extend(c.flush());
+        eprintln!("coalesced 2000 text deltas into {} emits (was 2001)", out.len());
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].kind, "tool");
+        let text: String = out.iter().filter(|e| e.kind == "text").map(|e| e.text.as_str()).collect();
+        assert_eq!(text, sent);
+        assert_eq!(out[0].text, sent[..1000]);
+    }
+    #[test]
+    fn window_size_and_kind_changes_flush() {
+        let start = std::time::Instant::now();
+        let mut c = Coalescer::default();
+        assert!(c.push(ev("text", "a"), start).is_empty());
+        assert_eq!(c.started_at(), Some(start));
+        let late = c.push(ev("text", "b"), start + COALESCE_WINDOW);
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].text, "ab");
+        assert!(c.push(ev("thinking", "x"), start).is_empty());
+        let switched = c.push(ev("text", "y"), start);
+        assert_eq!((switched[0].kind.as_str(), switched[0].text.as_str()), ("thinking", "x"));
+        let big = c.push(ev("text", &"z".repeat(COALESCE_BYTES)), start);
+        assert_eq!(big[0].text.len(), COALESCE_BYTES + 1);
+        assert!(c.flush().is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_buffer_shrinks_only_when_large_and_drained() {
+        assert!(super::should_shrink(10, 2 * 1024 * 1024));
+        assert!(!super::should_shrink(10, 1024 * 1024));
+        assert!(!super::should_shrink(super::FRAME_KEEP, 2 * 1024 * 1024));
+    }
     #[test]
     fn opencode_choices_keep_only_saved_models_and_retain_unavailable_ids() {
         let model = super::ModelInfo {
@@ -3273,6 +3404,27 @@ mod tests {
             codex_settings: None,
             images: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn only_harness_failures_mark_the_run_as_reaching_the_harness() {
+        let sink: Sink = Arc::new(|_| {});
+        // PandaCode's own validation fails before the harness.
+        let reached: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut local = config("claude");
+        local.mode = "bogus".into();
+        assert!(run_with_tools(local, sink.clone(), rx, None, reached.clone()).await.is_err());
+        assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
+        // A harness that cannot start is the harness's failure.
+        let reached: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let missing = Command::new("/nonexistent/pandacode-harness");
+        let started = HARNESS
+            .scope(reached.clone(), run_process_with_tools(config("claude"), sink, rx, missing, Vec::new(), None))
+            .await;
+        assert!(started.unwrap_err().starts_with("Could not start"));
+        assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

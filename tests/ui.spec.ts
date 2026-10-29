@@ -137,6 +137,8 @@ async function installReasoningPreview(page: Page): Promise<void> {
 
 async function captureEffortPresentation(page: Page): Promise<void> {
   await expect(modelPicker(page)).toHaveAttribute('data-popover-state', 'open');
+  // Let the menu's short entrance settle before recording what is on screen.
+  await expect.poll(() => modelPicker(page).evaluate(element => element.getAnimations().length)).toBe(0);
   await reasoningLabel(page).focus();
   await page.evaluate(() => {
     const selectors = ['.model-menu', '.model-menu-list', '.model-menu-option[aria-current="true"]', '.model-menu-settings', '.model-menu-effort', '.model-menu-rail', '#prompt', '#model-picker-trigger', '#breadcrumb button'];
@@ -1003,16 +1005,13 @@ test('chooses a project filter from its anchored menu using the keyboard', async
   await expect(page.locator('#navigation .task-item')).toHaveCount(4);
 });
 
-test('all projects: no folder headings; Tasks rows are one line and lead with their project icon', async ({ page }) => {
-  const tasks = page.locator('#navigation [data-thread-group="all"]');
+test('all projects: no folder headings; Finished rows are cards that lead with their project icon', async ({ page }) => {
+  const tasks = page.locator('#navigation [data-thread-group="review"]');
   await expect(page.locator('#navigation .folder-heading')).toHaveCount(0);
-  await expect(tasks.locator('.task-item .task-top > .task-app-icon').first()).toBeVisible();
-  await expect(tasks.locator('.task-item .task-checkout')).toHaveCount(0);
+  await expect(page.locator('#navigation [data-thread-group="all"], #navigation [data-thread-group="chats"]')).toHaveCount(0);
+  await expect(tasks.locator('.task-item .task-head > .task-app-icon').first()).toBeVisible();
   await expect(tasks.locator('.task-item .task-top .task-title').first()).toBeVisible();
-  // Each row is one line, with its harness and linked PR beside the title.
-  await expect(tasks.locator('.task-item .task-meta')).toHaveCount(0);
   await expect(tasks.locator('.task-item .task-top .task-provider').first()).toBeVisible();
-  for (const height of await tasks.locator('.task-item').evaluateAll(rows => rows.map(row => row.getBoundingClientRect().height))) expect(height).toBeLessThan(36);
   // One project on its own is named by the filter, which shows its icon: one line per task too.
   await chooseProjectFilter(page, 'pandacode');
   await expect(page.locator('#project-filter > .task-app-icon')).toHaveCount(1);
@@ -1060,12 +1059,13 @@ test('finds and selects projects beyond the first hundred filter options', async
   await expect(openTaskProject(page)).toHaveText('Fixture project 119');
 });
 
-test('menus open and close instantly and stay usable', async ({ page }) => {
+test('menus open with a brief settle, close at once and stay usable', async ({ page }) => {
   await page.getByRole('button', { name: 'Choose harness and model', exact: true }).click();
   const menu = page.getByRole('dialog', { name: 'Harness and model', exact: true });
   const search = menu.getByRole('combobox', { name: 'Search harnesses and models', exact: true });
   await expect(menu).toHaveAttribute('data-popover-state', 'open');
-  expect(await menu.evaluate(element => element.getAnimations().length)).toBe(0);
+  // Any entrance is short and never blocks input: the search takes focus right away.
+  expect(await menu.evaluate(element => Math.max(0, ...element.getAnimations().map(animation => Number(animation.effect?.getComputedTiming().endTime ?? 0))))).toBeLessThan(300);
   await expect(search).toBeFocused();
   await page.keyboard.type('animation-ready-model');
   await expect(search).toHaveValue('animation-ready-model');
@@ -1504,7 +1504,22 @@ test('coalesces appearance preferences without restoring stale glass or losing t
   await devtools.detach();
 });
 
+// Pads the sample test output past the card's eight-line preview, so its rows keep the full-data disclosure.
+async function longSampleOutput(page: Page) {
+  await page.route('**/src/preview.ts*', async route => {
+    const response = await route.fetch();
+    const source = await response.text();
+    const marker = /const sampleTestOutput\s*=\s*/;
+    expect(source).toMatch(marker);
+    const body = source.replace(marker, "const sampleTestOutput = 'RUNS src/components/search.test.ts\\n'.repeat(4) + ");
+    await route.fulfill({ response, body: previewBody(body) });
+  });
+  await page.reload();
+  await expect(page.locator('.task-item.selected .task-title')).toHaveText('Make search feel instant');
+}
+
 test('expands saved tool commands and file contents after reloading the conversation', async ({ page }) => {
+  await longSampleOutput(page);
   const read = toolByName(page, 'Read');
   await expandToolTurn(read);
   await read.locator(':scope > summary').click();
@@ -1527,6 +1542,7 @@ test('expands saved tool commands and file contents after reloading the conversa
 });
 
 test('coalesces live tool updates while preserving expansion and saves their details', async ({ page }) => {
+  await longSampleOutput(page);
   await page.clock.install();
   await page.reload();
   await expect(page.locator('.task-item.selected .task-title')).toHaveText('Make search feel instant');
@@ -1661,7 +1677,8 @@ test('caps long live tool activity without dropping the output being read', asyn
     const source = await response.text();
     const marker = /const toolMessage\s*=/;
     expect(source).toMatch(marker);
-    const body = source.replace(marker, `tool.output = 'Keep this first tool output available while I read it.'; const toolMessage =`)
+    // Longer than the card's preview, so the row keeps the full-data disclosure being read.
+    const body = source.replace(marker, `tool.output = 'Keep this first tool output available while I read it.' + '\\nstill reading'.repeat(10); const toolMessage =`)
       + '\nexport const emitActivityTestEvent = agent;\n';
     await route.fulfill({ response, body: previewBody(body) });
   });
@@ -1685,7 +1702,7 @@ test('caps long live tool activity without dropping the output being read', asyn
   await firstTool.locator(':scope > summary').click();
   await firstTool.locator('.tool-trace-raw > summary').click();
   const output = page.locator(`[data-tool-key="${key}"] [data-tool-section="output"] pre`);
-  await expect(output).toHaveText('Keep this first tool output available while I read it.');
+  await expect(output).toContainText('Keep this first tool output available while I read it.');
   await output.focus();
   await page.evaluate(async sessionId => {
     const { emitActivityTestEvent } = await import((window as any).__pandacodePreviewUrl);
@@ -1699,7 +1716,7 @@ test('caps long live tool activity without dropping the output being read', asyn
   }, sessionId);
   await page.clock.runFor(20);
   await expect(output).toBeFocused();
-  await expect(output).toHaveText('Keep this first tool output available while I read it.');
+  await expect(output).toContainText('Keep this first tool output available while I read it.');
   await expect(page.locator(`[data-tool-key="${key}"]`)).toHaveAttribute('open', '');
   await expect(page.locator('[data-tool-key="tool:long-live-39"]')).toHaveCount(1);
   const toolCount = await page.locator('.live-tools details.tool-activity').count();
@@ -2273,26 +2290,26 @@ test('saved user prompts keep old threads active until their own 24 hour boundar
   await expect(taskRow(page, 'session-4', 'inactive')).toBeVisible();
 });
 
-test('lists pending tasks of every project in one Tasks section that folds and stays folded', async ({ page }) => {
-  // Finished work sits in Finished; pending samples are listed under Tasks.
+test('lists pending tasks of every project in Finished, which folds and stays folded', async ({ page }) => {
+  // Only Active, Finished and Settled exist: pending samples are listed under Finished too.
   await page.route('**/src/preview.ts*', async route => {
     const response = await route.fetch();
     await route.fulfill({ response, body: (await response.text()).replace(/const providers\s*=/, `for (const s of sessions) s.taskStage = 'pending';\n$&`) });
   });
   await page.reload();
   await expect(projectFilter(page)).toHaveText('All projects');
-  const tasks = page.getByRole('region', { name: 'Tasks', exact: true });
+  const tasks = page.getByRole('region', { name: 'Finished tasks', exact: true });
   await expect(tasks.locator('.task-title')).toHaveText(['Make search feel instant', 'Refine the navigation', 'Add keyboard shortcuts', 'Explore the project']);
   await expect(activeRows(page).locator('.task-title')).toHaveText(['Make search feel instant']);
   // The row names its project, visibly once the sidebar is wide enough and always for assistive technology.
   await expect(taskRow(page, 'session-4').locator('.task-project')).toHaveText('pandacode');
-  const toggle = tasks.getByRole('button', { name: /^Tasks/ });
+  const toggle = tasks.getByRole('button', { name: /^Finished/ });
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
   await toggle.click();
   await expect(toggle).toHaveAttribute('aria-expanded', 'false');
   await expect(tasks.locator('.task-item')).toHaveCount(0);
   await page.reload();
-  await expect(page.getByRole('region', { name: 'Tasks', exact: true }).getByRole('button', { name: /^Tasks/ })).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.getByRole('region', { name: 'Finished tasks', exact: true }).getByRole('button', { name: /^Finished/ })).toHaveAttribute('aria-expanded', 'false');
 });
 
 test('moves a task to inactive automatically at the 24 hour response boundary', async ({ page }) => {
@@ -3243,13 +3260,16 @@ test('keeps the worktree terminal open when the previous checkout terminal fails
   await expect.poll(() => page.evaluate(() => (window as any).__pandacodeWorktreeCalls.filter((call: any) => call.command === 'close_terminal').length)).toBe(1);
 });
 
-test('the interface is instant: no transitions, no entrance motion, and presses keep a button in place', async ({ page }) => {
+test('motion is short and never gates input, and presses keep a button in place', async ({ page }) => {
   await page.locator('.sidebar-projects').getByRole('button', { name: 'Open project', exact: true }).click();
   await expect(page.locator('#dialog')).toBeVisible();
-  // The modal is fully there at once: nothing is animating it in (the action dock is the one animated surface).
-  expect(await page.evaluate(() => document.getAnimations().filter(animation => animation.playState === 'running' && animation.timeline instanceof DocumentTimeline && !((animation.effect as KeyframeEffect | null)?.target as Element | null)?.closest('#action-dock')).length)).toBe(0);
-  await expect(page.locator('.dialog-plate')).toHaveCSS('opacity', '1');
-  await expect(page.locator('#dialog .primary-button')).toHaveCSS('transition-duration', '0s');
+  // Every surface animation is brief, and the dialog takes input while it settles. Endless
+  // status indicators (the running-agents pulse) are ambient, not transitions.
+  const durations = await page.evaluate(() => document.getAnimations().filter(animation => animation.timeline instanceof DocumentTimeline).map(animation => animation.effect?.getComputedTiming()).filter(timing => timing && Number.isFinite(Number(timing.iterations))).map(timing => Number(timing!.endTime ?? 0)));
+  expect(Math.max(0, ...durations)).toBeLessThan(500);
+  const transition = await page.locator('#dialog .primary-button').evaluate(el => getComputedStyle(el).transitionDuration.split(',').map(value => Number.parseFloat(value) * (value.trim().endsWith('ms') ? 1 : 1000)));
+  expect(Math.max(...transition)).toBeGreaterThan(0);
+  expect(Math.max(...transition)).toBeLessThanOrEqual(400);
   await page.keyboard.press('Escape');
   await expect(page.locator('#dialog')).toBeHidden();
   await expect(page.locator('.dialog-plate')).toBeHidden();
@@ -3261,6 +3281,17 @@ test('the interface is instant: no transitions, no entrance motion, and presses 
   await page.mouse.down();
   expect(await send.evaluate(el => getComputedStyle(el).transform)).toBe(before);
   await page.mouse.up();
+});
+
+test('the toast sits in the bottom-right corner and wraps long text', async ({ page }) => {
+  const toast = page.locator('#toast');
+  await page.evaluate(() => { const toast = document.querySelector<HTMLElement>('#toast')!; toast.textContent = 'Could not open /Users/someone/projects/a-really-long-folder-name/with/a/deep/path/src/components/SomethingReallyLongFileName.tsx'; toast.hidden = false; });
+  const box = (await toast.boundingBox())!, viewport = page.viewportSize()!;
+  expect(box.width).toBeLessThanOrEqual(361);
+  expect(viewport.width - (box.x + box.width)).toBeLessThan(40);
+  expect(viewport.height - (box.y + box.height)).toBeLessThan(40);
+  expect(await toast.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await expect(toast).toHaveAttribute('role', 'status');
 });
 
 test('switching back to a thread draws it at once: formatted, at the bottom, with no loading frame', async ({ page }) => {
@@ -3332,7 +3363,9 @@ test('⌘F finds text in the thread, in your messages and the agent’s, and ste
 test('the prompt sits in the same place in every thread', async ({ page }) => {
   await expect(page.locator('#composer')).toBeVisible();
   const bottoms: number[] = [];
-  const measure = async () => { await expect(page.locator('#composer')).toBeVisible(); bottoms.push(Math.round((await page.locator('#composer').boundingBox())!.y + (await page.locator('#composer').boundingBox())!.height)); };
+  // Measured once surfaces have settled: panes arrive with a short spring.
+  const settled = () => page.evaluate(() => document.getAnimations().filter(animation => animation.timeline instanceof DocumentTimeline && animation.playState === 'running' && Number.isFinite(Number(animation.effect?.getComputedTiming().endTime))).length);
+  const measure = async () => { await expect(page.locator('#composer')).toBeVisible(); await expect.poll(settled).toBe(0); bottoms.push(Math.round((await page.locator('#composer').boundingBox())!.y + (await page.locator('#composer').boundingBox())!.height)); };
   const ids = await page.locator('#navigation .task-item').evaluateAll(rows => rows.map(row => (row as HTMLElement).dataset.id!));
   expect(ids.length).toBeGreaterThan(1);
   for (const id of ids) {

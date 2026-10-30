@@ -259,7 +259,7 @@ test('provider connections are grouped in Providers and never accept secrets in 
   await expect(dialog.getByRole('img', { name: 'How providers relate to agents', exact: true })).toHaveAttribute('data-tip', /the global environment variables are the one thing every harness gets/);
   // OpenCode models are chosen once, in Settings → Agents.
   await expect(dialog.getByRole('button', { name: 'Choose models', exact: true })).toHaveCount(0);
-  await expect(dialog.getByText('agy', { exact: true })).toBeVisible();
+  await expect(dialog.locator('#google-connection').getByRole('heading', { name: /Google subscription/ })).toBeVisible();
   await expect(dialog.getByText('grok login', { exact: true })).toBeVisible();
   const paths = dialog.locator('details').filter({ has: page.getByLabel('Grok executable', { exact: true }) });
   await paths.last().locator('summary').click();

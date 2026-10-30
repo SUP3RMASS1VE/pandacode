@@ -1375,7 +1375,7 @@ pub(crate) fn recorded_image_data_url(target: &Path) -> Result<String, String> {
         Some("svg") => "image/svg+xml",
         _ => return Err("Only PNG, JPEG, GIF, WebP and SVG images can be shown".into()),
     };
-    let file = File::open(&target).map_err(|e| e.to_string())?;
+    let file = File::open(target).map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     if !metadata.is_file() || metadata.len() > IMAGE_LIMIT {
         return Err("The image is missing or larger than 8 MB".into());

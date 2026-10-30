@@ -180,6 +180,7 @@ export function mountSkillsLibrary(host: HTMLElement, options: SkillsLibraryHost
     if (!input.checked) {
       void run(async () => {
         const change = await options.call<{ kept: string[] }>('skills_deactivate', { id, harness, scope, ...scopeArgs(scope) });
+        window.dispatchEvent(new Event('pandacode:skills-changed'));
         return change.kept.length ? `Left ${change.kept.length} edited file${change.kept.length === 1 ? '' : 's'} in place: ${change.kept.join(', ')}` : `${item.name} is off for ${harnessName(harness)}.`;
       });
       return;
@@ -193,6 +194,7 @@ export function mountSkillsLibrary(host: HTMLElement, options: SkillsLibraryHost
     pending = null;
     return run(async () => {
       await options.call('skills_activate', { id, harness, scope, ...scopeArgs(scope), acknowledge });
+      window.dispatchEvent(new Event('pandacode:skills-changed'));
       const row = matrix.harnesses.find(r => r.harness === harness);
       return row?.prompt ? `${harnessName(harness)} has no skill files; PandaCode adds this to its messages.` : `Active for ${harnessName(harness)}.`;
     });

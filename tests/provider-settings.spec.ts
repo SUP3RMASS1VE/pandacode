@@ -1,6 +1,60 @@
 import { pickModel, showHarness } from './model-picker-helper';
 import { expect, test, type Page } from '@playwright/test';
 
+test('ChatGPT browser sign-in shows its account, supports sign-out and cancellation', async ({ page }, testInfo) => {
+  const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const settings = page.getByRole('region', { name: 'Settings', exact: true });
+  await settings.getByRole('tab', { name: 'Providers', exact: true }).click();
+  const card = page.locator('#chatgpt-connection');
+  const login = card.getByRole('button', { name: 'Sign in with ChatGPT', exact: true });
+  await expect(card.locator('[data-chatgpt-status]')).toHaveText('Not signed in with ChatGPT');
+  await login.click();
+  await expect(card.getByRole('button', { name: 'Waiting for browser…' })).toBeDisabled();
+  await expect(card.getByRole('button', { name: 'Cancel sign-in' })).toBeVisible();
+  await expect(card.locator('[data-chatgpt-status]')).toContainText('Signed in with ChatGPT · preview@example.test · plus');
+  await expect(login).toBeHidden();
+  await card.screenshot({ path: testInfo.outputPath('chatgpt-signed-in.png') });
+  await card.getByRole('button', { name: 'Sign out', exact: true }).click();
+  await expect(card.locator('[data-chatgpt-status]')).toHaveText('Not signed in with ChatGPT');
+  await login.click();
+  await card.getByRole('button', { name: 'Cancel sign-in' }).click();
+  await expect(card.locator('[data-chatgpt-feedback]')).toContainText('cancelled');
+  await expect(login).toBeEnabled();
+  await login.click();
+  await settings.getByRole('tab', { name: 'Agents', exact: true }).click();
+  await settings.getByRole('tab', { name: 'Providers', exact: true }).click();
+  await expect(card.locator('[data-chatgpt-status]')).toHaveText('Not signed in with ChatGPT');
+  await expect(login).toBeEnabled();
+  expect(errors).toEqual([]);
+});
+
+test('provider connections: ChatGPT sign-in explains a missing Codex installation and recovers after login errors', async ({ page }) => {
+  await page.route('**/src/preview.ts*', async route => {
+    const response = await route.fetch();
+    await route.fulfill({ response, body: (await response.text()).replace(/switch\s*\(command\)\s*\{/, `
+      window.__chatgptTestStatus ??= {installed:false,state:'signedOut',email:null,plan:null};
+      if (command === 'provider_chatgpt_status') return window.__chatgptTestStatus;
+      if (command === 'provider_chatgpt_login') throw new Error('ChatGPT sign-in timed out. Try again.');
+      switch(command) {`) });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('region', { name: 'Settings', exact: true }).getByRole('tab', { name: 'Providers', exact: true }).click();
+  const card = page.locator('#chatgpt-connection');
+  const login = card.getByRole('button', { name: 'Sign in with ChatGPT', exact: true });
+  await expect(card.locator('[data-chatgpt-status]')).toContainText('Codex is not installed');
+  await expect(login).toBeDisabled();
+  await page.evaluate(() => { (window as any).__chatgptTestStatus = {installed:true,state:'apiKey',email:null,plan:null}; });
+  await card.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(card.locator('[data-chatgpt-status]')).toContainText('API key with separate API billing');
+  await login.click();
+  await expect(card.locator('[data-chatgpt-feedback]')).toContainText('timed out');
+  await expect(login).toBeEnabled();
+  await expect(card.getByRole('button', { name: 'Cancel sign-in' })).toBeHidden();
+});
+
 test('global and per-provider environment variables are added, toggled, removed, and never echoed', async ({ page }) => {
   const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
@@ -630,4 +684,36 @@ test('OpenAI Compatible ignores stale discovery and reports empty or unreachable
   await save.click();
   await expect(url).toHaveValue('http://ready.test:8080/v1');
   await expect(card.locator('.compatible-feedback')).toContainText('Provider saved');
+});
+
+test('provider connections: Google subscription sign-in and model usage', async ({page}, testInfo) => {
+  await page.route('**/src/preview.ts*', async route => { const response=await route.fetch(); await route.fulfill({response,body:(await response.text())+`\nproviders.find(p=>p.id==='antigravity').installed=true;`}); });
+  await page.goto('/');
+  await page.getByRole('button',{name:'Settings',exact:true}).click();
+  await page.getByRole('region',{name:'Settings',exact:true}).getByRole('tab',{name:'Providers',exact:true}).click();
+  const card=page.locator('#google-connection');
+  await expect(card.locator('[data-google-status]')).toContainText('Google connection ready');
+  await card.getByRole('button',{name:'Sign in with Google',exact:true}).click();
+  await expect(card.locator('[data-google-feedback]')).toHaveText('Google sign-in completed.');
+  await card.screenshot({path:testInfo.outputPath('google-subscription.png')});
+  await card.getByRole('button',{name:'Google model usage',exact:true}).click();
+  await expect(page.getByRole('dialog')).toContainText('Antigravity');
+});
+
+test('provider connections: Google sign-in cancellation stays local to its attempt', async ({page}) => {
+  await page.route('**/src/preview.ts*',async route=>{
+    const response=await route.fetch();
+    await route.fulfill({response,body:(await response.text()).replace(/switch\s*\(command\)\s*\{/,`
+      if(command==='provider_google_login') return await new Promise((resolve,reject)=>{window.__googleCancel=()=>reject(new Error('Google sign-in cancelled.'));});
+      if(command==='provider_google_cancel') {window.__googleCancel?.();return;}
+      switch(command) {`)});
+  });
+  await page.goto('/');
+  await page.getByRole('button',{name:'Settings',exact:true}).click();
+  await page.getByRole('region',{name:'Settings',exact:true}).getByRole('tab',{name:'Providers',exact:true}).click();
+  const card=page.locator('#google-connection');
+  await card.getByRole('button',{name:'Sign in with Google',exact:true}).click();
+  await card.getByRole('button',{name:'Cancel sign-in',exact:true}).click();
+  await expect(card.locator('[data-google-feedback]')).toContainText('cancelled');
+  await expect(card.getByRole('button',{name:'Sign in with Google',exact:true})).toBeEnabled();
 });

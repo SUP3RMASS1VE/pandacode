@@ -70,6 +70,42 @@ PandaCode needs no provider or model of its own:
   conversations and run Codex task commands (`integrations.rs`). None of this is
   needed to use other agents.
 
+## ChatGPT subscription
+
+Settings → Providers → **ChatGPT subscription** uses the existing Codex harness.
+Click **Sign in with ChatGPT** to open Codex's browser sign-in. PandaCode waits
+for the browser flow and shows the account and plan when it completes. No terminal
+command is needed for sign-in. If Codex already has a ChatGPT login, PandaCode
+shows it. **Refresh** checks the saved account without refreshing its token.
+
+**ChatGPT usage** opens the usage panel directly on Codex. Reported weekly and
+shorter windows show the percentage used, percentage remaining and reset time.
+These are the ChatGPT plan limits exposed through Codex, shared across apps using
+that account. Missing weekly limits are shown as unavailable, never guessed.
+The panel reads limits only when opened or refreshed, using the existing usage
+cache; it does not poll in the background.
+
+**Cancel sign-in**, leaving Providers, or quitting PandaCode stops the pending
+login process; it also times out after three minutes. **Sign out** clears the
+shared Codex login, including the CLI's login for that configuration. Named
+connections with their own config folder are separate.
+
+On macOS, PandaCode also finds the Codex CLI bundled in ChatGPT under Applications
+when no standalone Codex is found. If Codex is missing, **Advanced setup** explains how to install it with
+`npm install -g @openai/codex` and refresh Settings → Agents. It also keeps
+`codex login` and `codex login status` as terminal fallbacks.
+
+Choose **Codex** in the task's model selector, then choose a model and reasoning
+effort. PandaCode reads the model catalog from the installed Codex CLI; model
+access and usage limits depend on your plan. This does not promise every model
+or feature available in the ChatGPT app. API-key sign-in uses separate API billing.
+See [OpenAI's authentication guide](https://learn.chatgpt.com/docs/auth).
+
+Codex owns sign-in, credential storage and token renewal. PandaCode adds no
+account or separate credential copy. The provider card also supports a custom
+Codex executable and environment variables. For separate Codex accounts or
+configurations, use a named Codex connection with its own config folder.
+
 ## Named connections
 
 Settings → Providers → Connections adds named setups of one harness, such as
@@ -500,8 +536,8 @@ subprocess credential scrubbing is enabled.
 
 Antigravity launches Google's official `agy_acp_server.par` (`agy_acp_server.exe`
 on Windows), which can be selected in Settings. The standalone `agy` terminal
-CLI is not misidentified as an ACP server. The executable and provider sign-in
-must already be installed. ACP initialization/session metadata supplies its model
+CLI is not misidentified as an ACP server. The executable must already be installed. Personal Google sign-in can be completed from the
+Google subscription card in Settings → Providers. ACP initialization/session metadata supplies its model
 labels and supported controls; image, HTTP MCP, resume, and planning support are
 checked explicitly. No private API, unofficial adapter, or browser-cookie
 authentication is used. Antigravity's own policy applies, with ACP approval
@@ -1135,3 +1171,22 @@ and settings (`app.pandacode.cloud`) and bot channel tokens (`app.pandacode.bots
   GLM read uses the file, else the noninteractive helper (`usage_keychain.rs`).
 - **Linux:** the Secret Service. **Windows:** Credential Manager. Neither prompts after an
   update.
+
+## Google account subscription
+
+Settings → Providers → **Google subscription** signs in with personal Google OAuth
+through the official Antigravity ACP engine. Choose **Antigravity** in the model
+selector afterwards. The standalone engines run on demand; the Antigravity desktop
+app is not required. Google owns OAuth credentials and refresh; PandaCode only
+records the user's choice to use personal Google sign-in.
+
+**Google model usage** opens Antigravity's on-demand quota report: model groups,
+weekly and five-hour allowances, and reset times reported by Google. This is the
+Antigravity plan allowance, rather than a total for every Gemini app feature.
+API keys have separate billing. Google determines model availability and limits.
+
+PandaCode discovers optional standalone engines installed under
+`~/.local/share/pandacode/google/`: `agy_acp_server.par` with its sibling
+`localharness_external`, and the standalone CLI named `agy`. Existing PATH
+installations and the ACP executable override remain supported. Install engines
+from Google's official distributions; usage reports require agy 1.1.11 or later.

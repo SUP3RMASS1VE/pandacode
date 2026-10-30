@@ -144,6 +144,7 @@ information:
 | What | Where | How often |
 | --- | --- | --- |
 | Latest versions of installed coding CLIs | `formulae.brew.sh`, `downloads.claude.ai`, `api.github.com`, `cdn.kimi.com`, `registry.npmjs.org` (Cline) | About every 6 hours |
+| Google subscription (optional): the official Antigravity engine handles personal Google OAuth and authenticated model discovery | Google, through its installed engine | Sign-in only when requested; after enabling it, saved account authentication accompanies model discovery and tasks. Usage is checked only when opened or refreshed |
 | Plan usage checks for your signed-in agents | That agent's provider | When you open the menu bar item or the Usage dialog |
 | Public model price list (for cost estimates) | `raw.githubusercontent.com` | Daily |
 | App updates | None in this fork | Disabled to preserve custom features; update by merging upstream and rebuilding |
@@ -280,6 +281,12 @@ on-request approvals. **Full access** enables the harness's broadest mode. See
 
 Type `/` at the start of a message for the harness's commands and skills
 ([slash commands](docs/slash-commands.md)).
+
+The sidebar lists expandable **Projects**, with each project's chats underneath.
+Running chats stay in their project and show their status; settled chats fold
+inside that project. Projectless chats appear under **Recents**. Use a project's
+**…** menu to rename or remove it, or its **+** button to start a chat there.
+**Sort and view → Group by → Status** restores the Active/Finished layout.
 
 Keyboard shortcuts: `⌘/Ctrl N` new task, `⌘/Ctrl K` command palette,
 `⌘/Ctrl J` terminal, `⌘/Ctrl B` sidebar, `⌘/Ctrl ,` settings, `⌘/Ctrl F` find

@@ -25,8 +25,13 @@ pub struct SlashCommand {
     pub kind: String,
     pub source: String,
     pub reason: Option<String>,
-    #[serde(skip)]
+    #[serde(rename = "skill", serialize_with = "serialize_skill_flag")]
     pub invocation: Invocation,
+}
+
+// Expose a category flag, never the invocation's native path or dispatch data.
+fn serialize_skill_flag<S: serde::Serializer>(invocation: &Invocation, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_bool(matches!(invocation, Invocation::Skill { .. }))
 }
 
 #[derive(Clone, Debug)]
@@ -755,6 +760,7 @@ fn action_accepts_arguments(action: &str) -> bool {
         || matches!(
             action,
             "rename"
+                | "skills"
                 | "goal"
                 | "usage"
                 | "conversations"

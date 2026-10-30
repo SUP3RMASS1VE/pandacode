@@ -1536,6 +1536,11 @@ impl Protocol {
             "running"
         };
         match field(item, "type") {
+            "imageView" => {
+                let input = item["path"].as_str().filter(|path| path.len() <= 4096)
+                    .map(|path| json!({"path":path}).to_string());
+                self.tool_update(id, Some("view_image"), Some(status), input, None, step);
+            }
             "contextCompaction" => {
                 self.tool_update(
                     id,
@@ -4305,6 +4310,17 @@ mod tests {
             p.receive(full).unwrap().events.is_empty(),
             "Replayed tool_use must not reopen a finished call"
         );
+    }
+
+    #[test]
+    fn codex_image_views_keep_the_path_without_binary_data() {
+        let mut p = Protocol::new(config("codex"));
+        let start = p.receive(json!({"method":"item/started","params":{"item":{"type":"imageView","id":"img","path":"/tmp/project/scene.png"}}})).unwrap();
+        assert_eq!(activity(&start)["name"], "view_image");
+        let done = p.receive(json!({"method":"item/completed","params":{"item":{"type":"imageView","id":"img","status":"completed"}}})).unwrap();
+        let tool = activity(&done);
+        assert!(tool["input"].as_str().unwrap().contains("scene.png"));
+        assert_eq!(tool["status"], "completed");
     }
 
     #[test]

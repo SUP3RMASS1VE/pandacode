@@ -402,6 +402,7 @@ impl Library {
         let activation = Activation { harness: harness.into(), scope, project: project.clone(), surface: surface.into(), sha256: meta.sha256.clone(), files: written, excluded };
         let activations = meta.activations.iter().filter(|a| !matches(a)).cloned().chain([activation]).collect();
         self.save(&Meta { acknowledged, activations, ..meta })?;
+        crate::slash_commands::invalidate_provider(harness);
         drop(_guard);
         Ok(Change { items: self.list()?, kept: Vec::new() })
     }
@@ -427,6 +428,7 @@ impl Library {
         }
         let activations = meta.activations.iter().filter(|a| !matches(a)).cloned().collect();
         self.save(&Meta { activations, ..meta })?;
+        crate::slash_commands::invalidate_provider(harness);
         drop(_guard);
         Ok(Change { items: self.list()?, kept })
     }

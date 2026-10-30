@@ -1360,8 +1360,13 @@ const IMAGE_LIMIT: u64 = 8 * 1024 * 1024;
 /// An image in the workspace as a `data:` URL, so an agent's question can show it inline.
 /// Only image types, only inside the project, and bounded in size.
 pub fn image_data_url(root: &Path, path: &str) -> Result<String, String> {
-    use base64::Engine;
     let target = scoped_path(root, path)?;
+    recorded_image_data_url(&target)
+}
+
+/// Only for a path taken from a saved image-view tool record, never a caller-supplied path.
+pub(crate) fn recorded_image_data_url(target: &Path) -> Result<String, String> {
+    use base64::Engine;
     let mime = match target.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
@@ -1377,6 +1382,7 @@ pub fn image_data_url(root: &Path, path: &str) -> Result<String, String> {
     }
     let mut bytes = Vec::new();
     file.take(IMAGE_LIMIT + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > IMAGE_LIMIT { return Err("The image is larger than 8 MB".into()); }
     Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
 }
 
@@ -1520,6 +1526,7 @@ mod tests {
         assert_eq!(image_data_url(&f.root, "chart.png").unwrap(), "data:image/png;base64,iVBORw==");
         assert!(image_data_url(&f.root, "notes.txt").is_err(), "not an image");
         assert!(image_data_url(&f.root, "../outside.png").is_err(), "outside the project");
+        assert_eq!(recorded_image_data_url(&f.base.join("outside.png")).unwrap(), "data:image/png;base64,iVBORw==");
         assert!(image_data_url(&f.root, "missing.png").is_err());
     }
 

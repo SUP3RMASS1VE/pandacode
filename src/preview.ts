@@ -138,6 +138,9 @@ function previewRoute(text: string, pool: { provider: string; model: string; nam
   return { pick: ranking[0] ?? null, ranking, unrated: [], difficulty: Math.max(1, Math.round(difficulty * 10)), category: /test|bug|fix/i.test(text) ? 'debugging' : 'general coding', profiler: 'onnx', latencyMs: 12 };
 }
 let previewClaudeMode: 'inherit' | 'subscription' = 'inherit';
+let previewChatgptSignedIn = false;
+let previewChatgptLogin: { id: string; cancel: () => void } | undefined;
+const previewChatgptStatus = () => ({ installed: true, state: previewChatgptSignedIn ? 'chatgpt' : 'signedOut', email: previewChatgptSignedIn ? 'preview@example.test' : null, plan: previewChatgptSignedIn ? 'plus' : null });
 // Provider environment in the preview lives in memory so the Settings UI can be tested in a browser.
 const previewEnvState = { global: [] as [string, string][], providers: {} as Record<string, [string, string][]>, useGlobal: {} as Record<string, boolean> };
 const previewEnvNames = (vars: [string, string][]) => vars.map(([name]) => name);
@@ -833,16 +836,16 @@ function slashCatalog(provider: ProviderId) {
     ['memories', 'Configure memory preferences', 'preferences'], ['ps', 'Inspect background jobs', 'jobs'],
     ['stop', 'Choose jobs to stop', 'jobs'], ['clean', 'Choose jobs to stop', 'jobs'],
   ];
-  const accepts = new Set(['rename', 'goal', 'usage', 'conversations', 'fork', 'export', 'worktree', 'plan', 'fast', 'mention', 'cd', 'init', 'recap', 'console']);
+  const accepts = new Set(['rename', 'skills', 'goal', 'usage', 'conversations', 'fork', 'export', 'worktree', 'plan', 'fast', 'mention', 'cd', 'init', 'recap', 'console']);
   const commands = [...local, ...(provider === 'codex' ? codex : [])].map(([name, description, action]) => ({ id: `pandacode:${name}`, name: `/${name}`, description, kind: 'action', source: 'PandaCode', action, argumentHint: accepts.has(action) ? '[arguments]' : undefined }));
   if (provider === 'openai-compatible') {
     const skills = (previewSkills.call('skills_list', {}) as import('./skills-library').SkillItem[])
       .filter(item => item.kind === 'skill' && item.activations.some(a => a.harness === provider));
-    return { commands: [...commands, ...skills.flatMap(item => [item.id, `skills:${item.id}`].map(name => ({ id: `${provider}:${name}`, name: `/${name}`, description: item.description, kind: 'prompt', source: 'Skills library', action: undefined, argumentHint: '[request]' })))], warnings: [] };
+    return { commands: [...commands, ...skills.flatMap(item => [item.id, `skills:${item.id}`].map(name => ({ id: `${provider}:${name}`, name: `/${name}`, description: item.description, kind: 'prompt', skill: true, source: 'Skills library', action: undefined, argumentHint: '[request]' })))], warnings: [] };
   }
   const native = provider === 'codex' ? ['review', 'compact', 'project-guide'] : provider === 'claude' ? ['compact', 'review', 'project-guide'] : ['compact', 'usage', 'tasks', 'skill:project-guide'];
   const terminal = provider === 'codex' ? ['exit', 'quit', 'keymap', 'vim', 'raw', 'title', 'statusline', 'pets', 'pet', 'clear', 'app', 'ide', 'logout', 'feedback', 'approve'] : provider === 'claude' ? ['exit', 'quit', 'login', 'logout', 'doctor'] : ["yolo", "yes", "auto", "permission", "config", "plan", "swarm", "effort", "thinking", "provider", "providers", "btw", "h", "?", "clear", "sessions", "task", "plugins", "add-dir", "experiments", "experimental", "reload", "reload-tui", "goal", "init", "fork", "title", "feedback", "undo", "editor", "logout", "disconnect", "login", "export-md", "export", "export-debug-zip", "web", "exit", "quit", "q", "version"];
-  return { commands: [...commands, ...native.map(name => ({ id: `${provider}:${name}`, name: `/${name}`, description: `Sample ${provider} command`, kind: 'prompt', source: provider, action: undefined, argumentHint: '[arguments]' })), ...terminal.map(name => ({ id: `${provider}:${name}`, name: `/${name}`, description: `Open /${name} in the harness console`, kind: 'action', source: `${provider} console`, action: `console:${name}`, argumentHint: '[arguments]' }))], warnings: [] };
+  return { commands: [...commands, ...native.map(name => ({ id: `${provider}:${name}`, name: `/${name}`, description: `Sample ${provider} command`, kind: 'prompt', skill: provider === 'codex' && name === 'project-guide', source: provider, action: undefined, argumentHint: '[arguments]' })), ...terminal.map(name => ({ id: `${provider}:${name}`, name: `/${name}`, description: `Open /${name} in the harness console`, kind: 'action', source: `${provider} console`, action: `console:${name}`, argumentHint: '[arguments]' }))], warnings: [] };
 }
 function resolveSlash(provider: ProviderId, text: string): { action: string | null; arguments: string } {
   const match = /^\/([\p{L}\p{N}_:.-]+|\?)(?:\s+([\s\S]*))?$/u.exec(text.trim());
@@ -1047,6 +1050,17 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
   if (command.startsWith('recipes_')) { const r = recipesCommand(command, args); if (r.handled) return r.result as T; }
   let result: unknown;
   switch (command) {
+    case 'provider_chatgpt_status': result = previewChatgptStatus(); break;
+    case 'provider_chatgpt_login': {
+      if (previewChatgptLogin) throw new Error('ChatGPT sign-in is already changing.');
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { previewChatgptLogin = undefined; previewChatgptSignedIn = true; resolve(); }, 1500);
+        previewChatgptLogin = { id: args.loginId, cancel: () => { clearTimeout(timer); previewChatgptLogin = undefined; reject(new Error('ChatGPT sign-in cancelled.')); } };
+      });
+      result = previewChatgptStatus(); break;
+    }
+    case 'provider_chatgpt_cancel': { const pending = previewChatgptLogin; if (pending && pending.id === args.loginId) pending.cancel(); break; }
+    case 'provider_chatgpt_logout': previewChatgptSignedIn = false; result = previewChatgptStatus(); break;
     case 'check_agent_updates': result = providers.filter(provider => provider.installed && !['glm', 'mimo'].includes(provider.id)).map(provider => {
       const version = provider.version?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
       return { provider: provider.id, name: provider.name, providers: provider.id === 'claude' ? ['claude', 'glm', 'mimo'] : [provider.id], installedVersion: version, latestVersion: version, status: 'current', method: null, canUpdate: false, message: 'Browser preview · installed agents are checked in the desktop app.', checkedAt: Date.now(), docsUrl: null };
@@ -1374,6 +1388,8 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
     }
     case 'get_task': result = settleDraft(session(args.sessionId)); break;
     case 'list_providers': result = args.deviceId ? remoteProviders() : providers.map(p => { if (p.id !== 'openai-compatible') return p; const endpoint = previewConnections.connections.find(c => c.openaiCompatible)?.openaiCompatible; return {...p, models: (endpoint?.models ?? (endpoint ? [endpoint.modelId] : [])).map(id => ({id, name: id, description: 'From your model server'}))}; }); break;
+    case 'provider_google_login':
+    case 'provider_google_cancel': result = null; break;
     case 'provider_check_connection': result = { installed: true, acpReady: true, sessionReady: true, state: 'ready', message: 'Sample connection check. No prompt sent.' }; break;
     case 'list_slash_commands': result = slashCatalog(session(args.sessionId).provider); break;
     case 'resolve_slash_command': result = resolveSlash(session(args.sessionId).provider, String(args.text)); break;
@@ -1399,6 +1415,13 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
       break;
     }
     case 'add_project': { const p = { id: crypto.randomUUID(), name: args.path.split('/').pop() || 'Project', path: args.path }; projects.push(p); result = p; break; }
+    case 'rename_project': {
+      const project = projects.find(project => project.id === args.projectId);
+      if (!project) throw new Error('Project not found.');
+      const name = String(args.name).trim();
+      if (!name || [...name].length > 120 || /[\u0000-\u001f\u007f-\u009f]/.test(name)) throw new Error('Use a project name of 1–120 characters without control characters.');
+      project.name = name; result = { ...project }; break;
+    }
     case 'remove_project': architect.remove(sessions.filter(s => s.projectId === args.projectId).map(s => s.id)); projects = projects.filter(p => p.id !== args.projectId); break;
     case 'delete_session': {
       const task = session(args.sessionId); assertIdle(task);
@@ -1810,6 +1833,11 @@ export async function invoke<T>(command: string, args: Record<string, any>): Pro
       const path = String(args.path);
       if (!previewWorkspaceFiles.includes(path) || !isPreviewableFile(path)) throw new Error('This file cannot be previewed in the browser.');
       result = { path, name: path.split('/').pop(), url: 'http://127.0.0.1:4179/preview/' + encodeURIComponent(args.sessionId ?? args.projectId) + '/' + path.split('/').map(encodeURIComponent).join('/') }; break;
+    }
+    case 'tool_image': {
+      const row = (messages[args.sessionId] ?? []).find(message => {try {return JSON.parse(message.content).id === args.toolId;} catch {return false;}});
+      const path = row ? JSON.parse(JSON.parse(row.content).input).path : 'output/scene.png';
+      return invoke<T>('workspace_image', {sessionId:args.sessionId, path});
     }
     case 'workspace_image': {
       // A drawn stand-in for any workspace image a question shows.

@@ -4,6 +4,11 @@ Type `/` at the beginning of a message in either Conversation or the Board task
 panel. The menu shows names, descriptions, argument hints, and the selected
 harness's logo. Type to filter; use Up/Down to navigate and Tab or Enter to insert.
 Selection never starts a run. Add arguments and send the message separately.
+Selecting **/skills** opens a searchable picker of the current agent's enabled
+skills. Choose one to insert its command in your draft, keeping the text and
+attachments you already added, then send when ready. Sending `/skills` opens the
+same picker. **Manage skills…** opens Settings → Skills & rules if you need to
+import or enable a skill; Refresh reloads the agent's available skills.
 Escape dismisses the menu. The Refresh button explicitly reloads discovery.
 Local and cached commands appear immediately and remain selectable while the
 harness starts. A slow-start message explains the wait; a stalled request offers
